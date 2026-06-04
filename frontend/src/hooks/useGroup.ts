@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { groupApi } from "@/services/api";
 import type { Question, Answer, GroupRoundResult } from "@/types";
 
-export function useGroup(workshopId: number | null, groupId: number | null) {
+export function useGroup(workshopId: number | null, groupId: number | null, roundId?: number | null) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [answers, setAnswers] = useState<Answer[]>([]);
   const [aiResult, setAiResult] = useState<GroupRoundResult | null>(null);
@@ -37,6 +37,13 @@ export function useGroup(workshopId: number | null, groupId: number | null) {
     } catch { /* not ready yet */ }
   }, [workshopId, groupId]);
 
+  const clearRoundState = useCallback(() => {
+    setQuestions([]);
+    setAnswers([]);
+    setAiResult(null);
+    setError(null);
+  }, []);
+
   const submitAnswer = useCallback(async (participant_id: number, question_id: number, content: string) => {
     if (!groupId) return null;
     try {
@@ -64,6 +71,28 @@ export function useGroup(workshopId: number | null, groupId: number | null) {
     }
   }, [workshopId, groupId]);
 
+  const editAIResult = useCallback(async (
+    participant_id: number,
+    session_token: string,
+    edited_content: string,
+  ) => {
+    if (!workshopId || !groupId) return null;
+    try {
+      const r = await groupApi.editAIResult(
+        groupId,
+        workshopId,
+        participant_id,
+        session_token,
+        edited_content,
+      );
+      setAiResult(r);
+      return r;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 AI 结果失败");
+      return null;
+    }
+  }, [workshopId, groupId]);
+
   const addAnswer = useCallback((answer: Answer) => {
     setAnswers((prev) => {
       if (prev.some((a) => a.id === answer.id)) return prev;
@@ -73,16 +102,17 @@ export function useGroup(workshopId: number | null, groupId: number | null) {
 
   useEffect(() => {
     if (workshopId && groupId) {
+      clearRoundState();
       fetchQuestions();
       fetchAnswers();
       fetchAIResult();
     }
-  }, [workshopId, groupId, fetchQuestions, fetchAnswers, fetchAIResult]);
+  }, [workshopId, groupId, roundId, clearRoundState, fetchQuestions, fetchAnswers, fetchAIResult]);
 
   return {
     questions, answers, aiResult,
     loading, aiLoading, error,
-    fetchQuestions, fetchAnswers, fetchAIResult,
-    submitAnswer, triggerAI, addAnswer,
+    fetchQuestions, fetchAnswers, fetchAIResult, clearRoundState,
+    submitAnswer, triggerAI, editAIResult, addAnswer,
   };
 }

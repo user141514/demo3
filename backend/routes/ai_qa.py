@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from dependencies import get_ai_service, get_kb_service
-from models import AIQuestionLog, Participant, Workshop
+from models import AIQuestionLog, Participant, Workshop, Round
 from schemas import AIQuestionSubmit, AIQuestionOut
 from services.ai_service import DeepSeekService
 from services.knowledge_base_service import KnowledgeBaseService
@@ -27,10 +27,22 @@ async def ask_ai(
     if not participant or participant.workshop_id != workshop_id:
         raise HTTPException(status_code=403, detail="Participant not in this workshop")
 
+    workshop = await db.get(Workshop, workshop_id)
+    if not workshop:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+    result = await db.execute(
+        select(Round).where(Round.workshop_id == workshop_id, Round.round_number == workshop.current_round)
+    )
+    current_round = result.scalar_one_or_none()
+
     # Get group context from group's answers
     result = await db.execute(
         select(AIQuestionLog)
-        .where(AIQuestionLog.workshop_id == workshop_id, AIQuestionLog.group_id == participant.group_id)
+        .where(
+            AIQuestionLog.workshop_id == workshop_id,
+            AIQuestionLog.group_id == participant.group_id,
+            AIQuestionLog.round_id == (current_round.id if current_round else None),
+        )
         .order_by(AIQuestionLog.created_at.asc())
     )
     history = result.scalars().all()
@@ -46,12 +58,13 @@ async def ask_ai(
 
     log = AIQuestionLog(
         workshop_id=workshop_id, participant_id=data.participant_id,
+        round_id=current_round.id if current_round else None,
         group_id=participant.group_id, question=data.question, answer=answer,
     )
     db.add(log)
     await db.commit()
     await db.refresh(log)
-    return AIQuestionOut(id=log.id, question=log.question, answer=log.answer, created_at=log.created_at)
+    return AIQuestionOut(id=log.id, round_id=log.round_id, question=log.question, answer=log.answer, created_at=log.created_at)
 
 
 @router.get("/{workshop_id}/ai-questions", response_model=list[AIQuestionOut])
@@ -64,10 +77,24 @@ async def get_ai_questions(
     if not participant or participant.workshop_id != workshop_id:
         raise HTTPException(status_code=403, detail="Not in this workshop")
 
+    workshop = await db.get(Workshop, workshop_id)
+    if not workshop:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+    result = await db.execute(
+        select(Round).where(Round.workshop_id == workshop_id, Round.round_number == workshop.current_round)
+    )
+    current_round = result.scalar_one_or_none()
+
     result = await db.execute(
         select(AIQuestionLog)
-        .where(AIQuestionLog.participant_id == participant_id)
+        .where(
+            AIQuestionLog.participant_id == participant_id,
+            AIQuestionLog.round_id == (current_round.id if current_round else None),
+        )
         .order_by(AIQuestionLog.created_at.desc())
     )
     logs = result.scalars().all()
-    return [AIQuestionOut(id=l.id, question=l.question, answer=l.answer, created_at=l.created_at) for l in logs]
+    return [
+        AIQuestionOut(id=l.id, round_id=l.round_id, question=l.question, answer=l.answer, created_at=l.created_at)
+        for l in logs
+    ]

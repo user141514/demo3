@@ -137,8 +137,8 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 
 ```bash
 cd backend
-python -m venv venv
-source venv/Scripts/activate  # Windows
+py -3.10 -m venv venv
+venv\Scripts\Activate.ps1  # Windows
 pip install -r requirements.txt
 python seed.py    # 初始化数据库
 python main.py    # 启动 (localhost:8000)

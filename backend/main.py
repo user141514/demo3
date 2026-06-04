@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends
 
 from config import settings
 from database import init_db
-from dependencies import get_ws_manager
+from dependencies import get_ws_manager_from_ws
 from routes import workshops_router, rounds_router, knowledge_router, ai_qa_router
 from websocket_manager import WebSocketManager
 from services.ai_service import DeepSeekService
@@ -59,7 +59,7 @@ async def websocket_endpoint(
     workshop_id: int,
     websocket: WebSocket,
     channel: str = Query(default="all"),
-    ws_manager: WebSocketManager = Depends(get_ws_manager),
+    ws_manager: WebSocketManager = Depends(get_ws_manager_from_ws),
 ):
     await ws_manager.connect(workshop_id, websocket, channel=channel)
     try:

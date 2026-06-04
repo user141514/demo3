@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { workshopApi, groupApi } from "@/services/api";
-import type { WorkshopHostView, GroupRoundResult, SynthesisResult, HostInput } from "@/types";
+import type { WorkshopHostView } from "@/types";
 
 export function useWorkshopHost(workshopId: number | null, hostCode: string | null) {
   const [workshop, setWorkshop] = useState<WorkshopHostView | null>(null);
@@ -41,6 +41,18 @@ export function useWorkshopHost(workshopId: number | null, hostCode: string | nu
       return data;
     } catch (err) {
       setError(err instanceof Error ? err.message : "更新设置失败");
+      return null;
+    }
+  }, [workshopId, hostCode]);
+
+  const startTimer = useCallback(async () => {
+    if (!workshopId || !hostCode) return null;
+    try {
+      const data = await workshopApi.startTimer(workshopId, hostCode);
+      setWorkshop(data);
+      return data;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "开启计时失败");
       return null;
     }
   }, [workshopId, hostCode]);
@@ -123,6 +135,7 @@ export function useWorkshopHost(workshopId: number | null, hostCode: string | nu
   return {
     workshop, loading, error,
     fetchHost, unlockRound, updateRoundSettings,
+    startTimer,
     submitHostInput, editGroupResult, editSynthesis,
     triggerSynthesis, exportMarkdown,
   };

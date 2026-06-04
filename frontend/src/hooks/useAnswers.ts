@@ -1,8 +1,8 @@
 import { useState, useCallback } from "react";
-import { api } from "@/services/api";
+import { groupApi } from "@/services/api";
 import type { Answer, Question } from "@/types";
 
-export function useAnswers(roundId: number | null) {
+export function useAnswers(groupId: number | null, workshopId: number | null) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [answers, setAnswers] = useState<Answer[]>([]);
   const [loading, setLoading] = useState(false);
@@ -10,11 +10,11 @@ export function useAnswers(roundId: number | null) {
   const [error, setError] = useState<string | null>(null);
 
   const fetchQuestions = useCallback(async () => {
-    if (!roundId) return;
+    if (!groupId || !workshopId) return;
     setLoading(true);
     setError(null);
     try {
-      const data = await api.getQuestions(roundId);
+      const data = await groupApi.getQuestions(groupId, workshopId);
       setQuestions(data);
     } catch (err) {
       setError(
@@ -23,14 +23,14 @@ export function useAnswers(roundId: number | null) {
     } finally {
       setLoading(false);
     }
-  }, [roundId]);
+  }, [groupId, workshopId]);
 
   const fetchAnswers = useCallback(async () => {
-    if (!roundId) return;
+    if (!groupId || !workshopId) return;
     setLoading(true);
     setError(null);
     try {
-      const data = await api.getAnswers(roundId);
+      const data = await groupApi.getAnswers(groupId, workshopId);
       setAnswers(data);
     } catch (err) {
       setError(
@@ -39,7 +39,7 @@ export function useAnswers(roundId: number | null) {
     } finally {
       setLoading(false);
     }
-  }, [roundId]);
+  }, [groupId, workshopId]);
 
   const submitAnswer = useCallback(
     async (
@@ -47,11 +47,11 @@ export function useAnswers(roundId: number | null) {
       participantId: number,
       content: string
     ) => {
-      if (!roundId) return null;
+      if (!groupId) return null;
       setSubmitting(true);
       setError(null);
       try {
-        const data = await api.submitAnswer(roundId, {
+        const data = await groupApi.submitAnswer(groupId, {
           question_id: questionId,
           participant_id: participantId,
           content,
@@ -67,7 +67,7 @@ export function useAnswers(roundId: number | null) {
         setSubmitting(false);
       }
     },
-    [roundId]
+    [groupId]
   );
 
   const addAnswer = useCallback((answer: Answer) => {
