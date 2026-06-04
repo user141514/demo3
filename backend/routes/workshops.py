@@ -1,0 +1,358 @@
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from database import get_db
+from dependencies import get_ws_manager, get_ai_service, get_export_service
+from models import (
+    Workshop, Participant, Round, Question, GroupRoundResult,
+    SynthesisResult, HostInput, KnowledgeDocument, WorkshopStatus, RoundStatus,
+    GroupResultStatus,
+)
+from schemas import (
+    WorkshopCreate, WorkshopCreateResponse, WorkshopMemberView, WorkshopHostView,
+    WorkshopJoinRequest, ParticipantOut, ParticipantWithToken, RoundOut, QuestionOut,
+    GroupInfo, RoundInfo, GroupRoundResultOut, SynthesisResultOut, HostInputOut,
+    HostInputCreate, RoundSettingsUpdate, GroupResultEdit, SynthesisResultEdit,
+    KnowledgeDocumentOut, ExportResponse,
+    ValidateHostRequest, ValidateInviteRequest, ValidateResponse,
+)
+from services.ai_service import DeepSeekService
+from services.export_service import ExportService
+from websocket_manager import WebSocketManager
+from seed import ROUNDS_DATA
+
+import secrets
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/workshops", tags=["workshops"])
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+async def _load_workshop(workshop_id: int, db: AsyncSession) -> Workshop:
+    result = await db.execute(
+        select(Workshop)
+        .options(
+            selectinload(Workshop.participants),
+            selectinload(Workshop.rounds).selectinload(Round.questions),
+            selectinload(Workshop.rounds).selectinload(Round.group_results),
+            selectinload(Workshop.rounds).selectinload(Round.synthesis_results),
+            selectinload(Workshop.rounds).selectinload(Round.host_inputs),
+            selectinload(Workshop.host_inputs),
+            selectinload(Workshop.synthesis_results),
+            selectinload(Workshop.knowledge_docs),
+        )
+        .where(Workshop.id == workshop_id)
+    )
+    w = result.scalar_one_or_none()
+    if not w:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+    return w
+
+
+def _build_host_view(w: Workshop) -> WorkshopHostView:
+    groups: dict[int, list] = {1: [], 2: [], 3: [], 4: []}
+    for p in w.participants:
+        groups.setdefault(p.group_id, []).append(p)
+    group_infos = []
+    for gid in sorted(groups):
+        leader = next((p.name for p in groups[gid] if p.is_group_leader), None)
+        group_infos.append(GroupInfo(
+            group_id=gid,
+            participant_count=len(groups[gid]),
+            leader_name=leader,
+            members=[ParticipantOut(id=p.id, workshop_id=p.workshop_id, name=p.name, group_id=p.group_id, is_group_leader=p.is_group_leader) for p in groups[gid]],
+        ))
+
+    round_infos = []
+    for rd in sorted(w.rounds, key=lambda r: r.round_number):
+        syn = next((sr for sr in rd.synthesis_results), None)
+        hi = next((h for h in rd.host_inputs), None)
+        round_infos.append(RoundInfo(
+            id=rd.id, round_number=rd.round_number, title=rd.title,
+            objective=rd.objective, status=rd.status,
+            discussion_time=rd.discussion_time, input_time=rd.input_time,
+            questions=[QuestionOut(id=q.id, round_id=q.round_id, content=q.content, order=q.order) for q in rd.questions],
+            group_results=[GroupRoundResultOut.model_validate(gr) for gr in rd.group_results],
+            synthesis=SynthesisResultOut.model_validate(syn) if syn else None,
+            host_input=HostInputOut.model_validate(hi) if hi else None,
+        ))
+
+    return WorkshopHostView(
+        id=w.id, title=w.title, host_name=w.host_name,
+        invite_code=w.invite_code, host_code=w.host_code, kb_admin_code=w.kb_admin_code,
+        current_round=w.current_round, status=w.status, created_at=w.created_at,
+        groups=group_infos, rounds=round_infos,
+        knowledge_docs=[KnowledgeDocumentOut.model_validate(d) for d in w.knowledge_docs if not d.is_deleted],
+    )
+
+
+def _build_member_view(w: Workshop, participant: Participant | None = None) -> WorkshopMemberView:
+    rounds_out = []
+    for rd in sorted(w.rounds, key=lambda r: r.round_number):
+        rounds_out.append(RoundOut(
+            id=rd.id, workshop_id=rd.workshop_id, round_number=rd.round_number,
+            title=rd.title, objective=rd.objective, status=rd.status,
+            discussion_time=rd.discussion_time, input_time=rd.input_time,
+            questions=[QuestionOut(id=q.id, round_id=q.round_id, content=q.content, order=q.order) for q in rd.questions],
+        ))
+    p_out = None
+    if participant:
+        p_out = ParticipantWithToken(
+            id=participant.id, workshop_id=participant.workshop_id,
+            name=participant.name, group_id=participant.group_id,
+            is_group_leader=participant.is_group_leader,
+            session_token=participant.session_token or "",
+        )
+    return WorkshopMemberView(
+        id=w.id, title=w.title, host_name=w.host_name,
+        invite_code=w.invite_code, current_round=w.current_round,
+        status=w.status, created_at=w.created_at,
+        participant=p_out, rounds=rounds_out,
+    )
+
+
+def _round_to_dict(r: Round) -> dict:
+    return {
+        "id": r.id, "round_number": r.round_number, "title": r.title,
+        "objective": r.objective, "status": r.status.value if r.status else "locked",
+        "discussion_time": r.discussion_time, "input_time": r.input_time,
+        "questions": [{"id": q.id, "content": q.content, "order": q.order} for q in r.questions],
+    }
+
+
+# ── endpoints ────────────────────────────────────────────────────────────
+
+@router.post("", response_model=WorkshopCreateResponse, status_code=201)
+async def create_workshop(data: WorkshopCreate, db: AsyncSession = Depends(get_db)):
+    w = Workshop(title=data.title, host_name=data.host_name)
+    db.add(w)
+    await db.flush()
+
+    for rd in ROUNDS_DATA:
+        st = RoundStatus.ACTIVE if rd["round_number"] == 1 else RoundStatus.LOCKED
+        r = Round(
+            workshop_id=w.id, round_number=rd["round_number"],
+            title=rd["title"], objective=rd["objective"],
+            status=st, discussion_time=rd["discussion_time"],
+            input_time=rd["input_time"],
+        )
+        db.add(r)
+        await db.flush()
+        for i, qc in enumerate(rd["questions"], 1):
+            db.add(Question(round_id=r.id, content=qc, order=i))
+
+    await db.commit()
+    return WorkshopCreateResponse(
+        id=w.id, title=w.title, host_name=w.host_name,
+        invite_code=w.invite_code, host_code=w.host_code, kb_admin_code=w.kb_admin_code,
+        created_at=w.created_at,
+    )
+
+
+@router.post("/validate-host", response_model=ValidateResponse)
+async def validate_host(data: ValidateHostRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Workshop).where(Workshop.host_code == data.host_code))
+    w = result.scalar_one_or_none()
+    if not w:
+        return ValidateResponse(valid=False)
+    return ValidateResponse(valid=True, workshop_id=w.id, workshop_title=w.title)
+
+
+@router.post("/validate-invite", response_model=ValidateResponse)
+async def validate_invite(data: ValidateInviteRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Workshop).where(Workshop.invite_code == data.invite_code))
+    w = result.scalar_one_or_none()
+    if not w or w.status == WorkshopStatus.COMPLETED:
+        return ValidateResponse(valid=False)
+    return ValidateResponse(valid=True, workshop_id=w.id, workshop_title=w.title)
+
+
+@router.get("/{workshop_id}/host", response_model=WorkshopHostView)
+async def get_host_view(workshop_id: int, code: str = Query(...), db: AsyncSession = Depends(get_db)):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    return _build_host_view(w)
+
+
+@router.get("/{workshop_id}", response_model=WorkshopMemberView)
+async def get_workshop(workshop_id: int, db: AsyncSession = Depends(get_db)):
+    w = await _load_workshop(workshop_id, db)
+    return _build_member_view(w)
+
+
+@router.post("/{workshop_id}/join", response_model=ParticipantWithToken)
+async def join_workshop(workshop_id: int, data: WorkshopJoinRequest, db: AsyncSession = Depends(get_db)):
+    w = await _load_workshop(workshop_id, db)
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Workshop already completed")
+    if w.invite_code != data.invite_code:
+        raise HTTPException(status_code=403, detail="Invalid invite code")
+
+    # Balanced group assignment
+    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    for p in w.participants:
+        counts[p.group_id] = counts.get(p.group_id, 0) + 1
+    min_count = min(counts.values())
+    candidates = [g for g, c in counts.items() if c == min_count]
+    import random
+    assigned_group = random.choice(candidates)
+
+    is_leader = counts[assigned_group] == 0  # first member in group is leader
+
+    token = secrets.token_hex(32)
+    p = Participant(
+        workshop_id=workshop_id, name=data.name,
+        group_id=assigned_group, is_group_leader=is_leader,
+        session_token=token,
+    )
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return ParticipantWithToken(
+        id=p.id, workshop_id=p.workshop_id, name=p.name,
+        group_id=p.group_id, is_group_leader=p.is_group_leader,
+        session_token=token,
+    )
+
+
+@router.post("/{workshop_id}/unlock-round", response_model=WorkshopHostView)
+async def unlock_round(
+    workshop_id: int, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+
+    current = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    if not current:
+        raise HTTPException(status_code=400, detail="No current round")
+
+    # If current round is already active, advance to next
+    if w.current_round < 4:
+        current.status = RoundStatus.COMPLETED
+        next_rd = next((r for r in w.rounds if r.round_number == w.current_round + 1), None)
+        if next_rd:
+            next_rd.status = RoundStatus.ACTIVE
+            w.current_round += 1
+            await db.commit()
+            w = await _load_workshop(workshop_id, db)
+            active_rd = next((r for r in w.rounds if r.round_number == w.current_round), None)
+            if active_rd:
+                await ws_manager.broadcast_round_change(workshop_id, w.current_round, _round_to_dict(active_rd))
+    else:
+        current.status = RoundStatus.COMPLETED
+        w.status = WorkshopStatus.COMPLETED
+        await db.commit()
+        w = await _load_workshop(workshop_id, db)
+
+    return _build_host_view(w)
+
+
+@router.post("/{workshop_id}/round-settings", response_model=WorkshopHostView)
+async def update_round_settings(
+    workshop_id: int, data: RoundSettingsUpdate, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+
+    current = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    if not current:
+        raise HTTPException(status_code=400, detail="No current round")
+    if data.discussion_time is not None:
+        current.discussion_time = data.discussion_time
+    if data.input_time is not None:
+        current.input_time = data.input_time
+    await db.commit()
+    return _build_host_view(await _load_workshop(workshop_id, db))
+
+
+@router.post("/{workshop_id}/host-input", response_model=HostInputOut)
+async def submit_host_input(
+    workshop_id: int, data: HostInputCreate, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+
+    _ = round  # avoid shadow
+    rd = await db.get(Round, data.round_id)
+    if not rd or rd.workshop_id != workshop_id:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    # Upsert
+    result = await db.execute(
+        select(HostInput).where(HostInput.round_id == data.round_id, HostInput.workshop_id == workshop_id)
+    )
+    hi = result.scalar_one_or_none()
+    if hi:
+        hi.content = data.content
+    else:
+        hi = HostInput(workshop_id=workshop_id, round_id=data.round_id, content=data.content)
+        db.add(hi)
+    await db.commit()
+    await db.refresh(hi)
+    return HostInputOut.model_validate(hi)
+
+
+@router.put("/{workshop_id}/group-results/{result_id}", response_model=GroupRoundResultOut)
+async def edit_group_result(
+    workshop_id: int, result_id: int, data: GroupResultEdit, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    gr = await db.get(GroupRoundResult, result_id)
+    if not gr:
+        raise HTTPException(status_code=404, detail="Result not found")
+    gr.edited_content = data.edited_content
+    gr.status = GroupResultStatus.EDITED
+    await db.commit()
+    await db.refresh(gr)
+    return GroupRoundResultOut.model_validate(gr)
+
+
+@router.put("/{workshop_id}/synthesis/{round_id}", response_model=SynthesisResultOut)
+async def edit_synthesis_result(
+    workshop_id: int, round_id: int, data: SynthesisResultEdit, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    result = await db.execute(
+        select(SynthesisResult).where(SynthesisResult.round_id == round_id, SynthesisResult.workshop_id == workshop_id)
+    )
+    sr = result.scalar_one_or_none()
+    if not sr:
+        raise HTTPException(status_code=404, detail="Synthesis result not found")
+    sr.edited_content = data.edited_content
+    sr.status = GroupResultStatus.EDITED
+    await db.commit()
+    await db.refresh(sr)
+    return SynthesisResultOut.model_validate(sr)
+
+
+@router.get("/{workshop_id}/export", response_model=ExportResponse)
+async def export_workshop(
+    workshop_id: int, code: str = Query(...),
+    export_svc: ExportService = Depends(get_export_service),
+    db: AsyncSession = Depends(get_db),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    md = await export_svc.generate_markdown(workshop_id)
+    safe_title = w.title.replace(" ", "_").replace("/", "_")
+    return ExportResponse(markdown=md, filename=f"{safe_title}_完整记录.md")
