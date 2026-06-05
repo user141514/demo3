@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { copyText } from "@/lib/clipboard";
 import { workshopApi } from "@/services/api";
 import {
   clearLastHostWorkshop,
@@ -132,8 +133,12 @@ export function HomePage() {
     navigate(`/workshop/${record.workshop_id}/host?code=${encodeURIComponent(record.host_code)}`);
   };
 
-  const copyCode = (code: string, label: string) => {
-    navigator.clipboard.writeText(code);
+  const copyCode = async (code: string, label: string) => {
+    const copiedCode = await copyText(code);
+    if (!copiedCode) {
+      setError("复制失败，请手动复制");
+      return;
+    }
     setCopied(label);
     setTimeout(() => setCopied(null), 2000);
   };

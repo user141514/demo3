@@ -45,6 +45,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import type { Answer, GroupRoundResult, RoundInfo, WSMessage } from "@/types";
 
@@ -262,7 +263,11 @@ export function HostDashboard() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(content);
+      const copied = await copyText(content);
+      if (!copied) {
+        setLocalError("复制失败，请手动复制");
+        return;
+      }
       setCopiedKey(key);
       window.setTimeout(() => setCopiedKey(null), 1500);
     } catch {
@@ -668,7 +673,7 @@ export function HostDashboard() {
                       <CardTitle className="text-lg">当前轮次信息</CardTitle>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <span className="font-medium">第 {currentRound.round_number} 轮: {currentRound.title}</span>
                         <Badge variant={ROUND_STATUS_VARIANT[currentRound.status] ?? "outline"}>
                           {ROUND_STATUS_LABEL[currentRound.status] ?? currentRound.status}
@@ -1197,8 +1202,9 @@ export function HostDashboard() {
                   </DialogHeader>
                   {exportData && (
                     <div className="space-y-4">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between gap-2">
                         <p className="text-sm text-muted-foreground">文件名: {exportData.filename}</p>
+                        {copyButton(exportData.markdown, "export-markdown")}
                         <Button size="sm" onClick={handleDownloadExport} className="gap-1">
                           <Download className="h-4 w-4" />
                           下载
