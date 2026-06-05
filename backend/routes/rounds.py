@@ -15,6 +15,7 @@ from models import (
 from schemas import (
     AnswerSubmit, AnswerOut, QuestionOut, GroupRoundResultOut,
     SynthesisResultOut, GroupResultEdit, GroupResultMemberEdit,
+    GroupAITrigger, GroupLeaderTransfer, ParticipantOut,
 )
 from services.ai_service import DeepSeekService
 from websocket_manager import WebSocketManager
@@ -42,6 +43,22 @@ def _timer_remaining_seconds(rd: Round) -> Optional[int]:
 def _is_timer_expired(rd: Round) -> bool:
     remaining = _timer_remaining_seconds(rd)
     return remaining is not None and remaining <= 0
+
+
+def _participant_out(p: Participant) -> ParticipantOut:
+    return ParticipantOut(
+        id=p.id,
+        workshop_id=p.workshop_id,
+        name=p.name,
+        group_id=p.group_id,
+        is_group_leader=p.is_group_leader,
+    )
+
+
+def _result_updated_at(gr: GroupRoundResult) -> Optional[str]:
+    if not gr.updated_at:
+        return None
+    return _as_utc(gr.updated_at).isoformat().replace("+00:00", "Z")
 
 
 # ── group question/answer endpoints ─────────────────────────────────────
@@ -76,8 +93,14 @@ async def submit_group_answer(
     ws_manager: WebSocketManager = Depends(get_ws_manager),
 ):
     participant = await db.get(Participant, data.participant_id)
-    if not participant or participant.group_id != group_id:
-        raise HTTPException(status_code=403, detail="Participant not in this group")
+    if (
+        not participant
+        or participant.group_id != group_id
+        or participant.session_token != data.session_token
+    ):
+        raise HTTPException(status_code=403, detail="Invalid participant")
+    if not participant.is_group_leader:
+        raise HTTPException(status_code=403, detail="Only group leader can submit answers")
 
     question = await db.get(Question, data.question_id)
     if not question:
@@ -85,6 +108,11 @@ async def submit_group_answer(
     rd = await db.get(Round, question.round_id)
     if not rd:
         raise HTTPException(status_code=404, detail="Round not found")
+    if participant.workshop_id != rd.workshop_id:
+        raise HTTPException(status_code=403, detail="Participant not in this workshop")
+    w = await db.get(Workshop, rd.workshop_id)
+    if w and w.is_review_mode:
+        raise HTTPException(status_code=403, detail="当前为历史轮次查看模式，不能提交回答")
     if rd.status not in ("active", "input"):
         raise HTTPException(status_code=400, detail="Round is not accepting answers")
     if _is_timer_expired(rd):
@@ -143,11 +171,62 @@ async def get_group_answers(
     ]
 
 
+@router.put("/groups/{group_id}/leader", response_model=List[ParticipantOut])
+async def transfer_group_leader(
+    group_id: int,
+    data: GroupLeaderTransfer,
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    participant = await db.get(Participant, data.participant_id)
+    if (
+        not participant
+        or participant.workshop_id != data.workshop_id
+        or participant.group_id != group_id
+        or participant.session_token != data.session_token
+    ):
+        raise HTTPException(status_code=403, detail="Invalid participant")
+    if not participant.is_group_leader:
+        raise HTTPException(status_code=403, detail="Only group leader can transfer leadership")
+
+    new_leader = await db.get(Participant, data.new_leader_participant_id)
+    if (
+        not new_leader
+        or new_leader.workshop_id != data.workshop_id
+        or new_leader.group_id != group_id
+    ):
+        raise HTTPException(status_code=400, detail="New leader must be in this group")
+
+    result = await db.execute(
+        select(Participant)
+        .where(Participant.workshop_id == data.workshop_id, Participant.group_id == group_id)
+        .order_by(Participant.id)
+    )
+    members = list(result.scalars().all())
+    for member in members:
+        member.is_group_leader = member.id == new_leader.id
+
+    await db.commit()
+    result = await db.execute(
+        select(Participant)
+        .where(Participant.workshop_id == data.workshop_id, Participant.group_id == group_id)
+        .order_by(Participant.id)
+    )
+    updated_members = list(result.scalars().all())
+    out = [_participant_out(member) for member in updated_members]
+    await ws_manager.broadcast_group_leader_changed(
+        data.workshop_id,
+        group_id,
+        [member.model_dump() for member in out],
+    )
+    return out
+
+
 # ── AI generation ───────────────────────────────────────────────────────
 
 @router.post("/groups/{group_id}/ai-generate", response_model=GroupRoundResultOut)
 async def trigger_group_ai(
-    group_id: int, workshop_id: int = Query(...),
+    group_id: int, data: GroupAITrigger, workshop_id: int = Query(...),
     db: AsyncSession = Depends(get_db),
     ai_service: DeepSeekService = Depends(get_ai_service),
     ws_manager: WebSocketManager = Depends(get_ws_manager),
@@ -155,6 +234,19 @@ async def trigger_group_ai(
     w = await db.get(Workshop, workshop_id)
     if not w:
         raise HTTPException(status_code=404, detail="Workshop not found")
+    if w.is_review_mode:
+        raise HTTPException(status_code=403, detail="当前为历史轮次查看模式，不能重新触发 AI 提炼")
+
+    participant = await db.get(Participant, data.participant_id)
+    if (
+        not participant
+        or participant.workshop_id != workshop_id
+        or participant.group_id != group_id
+        or participant.session_token != data.session_token
+    ):
+        raise HTTPException(status_code=403, detail="Invalid participant")
+    if not participant.is_group_leader:
+        raise HTTPException(status_code=403, detail="Only group leader can trigger AI extraction")
 
     result = await db.execute(
         select(Round).where(
@@ -182,8 +274,17 @@ async def trigger_group_ai(
         db.add(gr)
     else:
         gr.status = GroupResultStatus.PROCESSING
+        gr.validation_error = None
     await db.commit()
     await db.refresh(gr)
+    await ws_manager.broadcast_ai_result_status(
+        workshop_id,
+        group_id,
+        active_round.round_number,
+        gr.status.value,
+        gr.validation_error,
+        _result_updated_at(gr),
+    )
 
     # Gather answers
     result = await db.execute(
@@ -201,9 +302,19 @@ async def trigger_group_ai(
     )
     rows = result.all()
     if not rows:
-        gr.status = GroupResultStatus.PENDING
+        gr.status = GroupResultStatus.VALIDATION_FAILED
+        gr.validation_error = "本组暂无回答，无法进行 AI 提炼"
         await db.commit()
-        raise HTTPException(status_code=400, detail="No answers from this group")
+        await db.refresh(gr)
+        await ws_manager.broadcast_ai_result_status(
+            workshop_id,
+            group_id,
+            active_round.round_number,
+            gr.status.value,
+            gr.validation_error,
+            _result_updated_at(gr),
+        )
+        raise HTTPException(status_code=400, detail=gr.validation_error)
 
     answers_text = ""
     for a, _p, q in rows:
@@ -238,7 +349,16 @@ async def trigger_group_ai(
     await db.refresh(gr)
 
     out = GroupRoundResultOut.model_validate(gr)
-    await ws_manager.broadcast_result_ready(workshop_id, group_id, round_num, out.model_dump())
+    result_data = out.model_dump(mode="json")
+    await ws_manager.broadcast_ai_result_status(
+        workshop_id,
+        group_id,
+        round_num,
+        gr.status.value,
+        gr.validation_error,
+        _result_updated_at(gr),
+    )
+    await ws_manager.broadcast_result_ready(workshop_id, group_id, round_num, result_data)
     return out
 
 
@@ -286,6 +406,8 @@ async def edit_group_ai_result(
     w = await db.get(Workshop, workshop_id)
     if not w:
         raise HTTPException(status_code=404, detail="Workshop not found")
+    if w.is_review_mode:
+        raise HTTPException(status_code=403, detail="当前为历史轮次查看模式，不能编辑 AI 提炼结果")
 
     result = await db.execute(
         select(Round).where(Round.workshop_id == workshop_id, Round.round_number == w.current_round)
@@ -310,7 +432,7 @@ async def edit_group_ai_result(
     await db.refresh(gr)
 
     out = GroupRoundResultOut.model_validate(gr)
-    await ws_manager.broadcast_result_ready(workshop_id, group_id, active_round.round_number, out.model_dump())
+    await ws_manager.broadcast_result_ready(workshop_id, group_id, active_round.round_number, out.model_dump(mode="json"))
     return out
 
 
@@ -333,7 +455,10 @@ async def trigger_synthesis(
     group_results = result.scalars().all()
     ready_results = [g for g in group_results if g.original_content and g.status in (GroupResultStatus.READY, GroupResultStatus.EDITED)]
     if len(ready_results) < 2:
-        raise HTTPException(status_code=400, detail="Need at least 2 group results")
+        raise HTTPException(
+            status_code=400,
+            detail="当前可综合的提炼结果不足，请至少等待两个小组提交提炼结果后再进行综合提炼。",
+        )
 
     # Upsert synthesis result
     result = await db.execute(

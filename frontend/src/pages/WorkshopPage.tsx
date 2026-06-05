@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { useWorkshop } from "@/hooks/useWorkshop";
 import { useGroup } from "@/hooks/useGroup";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -17,6 +17,14 @@ import { Separator } from "@/components/ui/separator";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Send,
   Sparkles,
   Users,
@@ -32,7 +40,7 @@ import {
   GripVertical,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { WSMessage, Answer, Round } from "@/types";
+import type { WSMessage, Answer, Participant, Round } from "@/types";
 
 const PANEL_RATIO_KEY = "workshop-member-panel-ratio";
 const ROUND_LABELS = ["关键领导力维度", "领导力维度分层", "领导力行为描述", "领导力应用场景"];
@@ -51,6 +59,7 @@ function clamp(value: number, min: number, max: number) {
 
 export function WorkshopPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const workshopId = id ? parseInt(id, 10) : null;
   const splitRef = useRef<HTMLDivElement | null>(null);
 
@@ -61,7 +70,7 @@ export function WorkshopPage() {
   );
   const {
     questions, answers, aiResult, loading: groupLoading, aiLoading,
-    submitAnswer, triggerAI, editAIResult, fetchAIResult, addAnswer, clearRoundState,
+    submitAnswer, triggerAI, editAIResult, transferLeader, fetchAIResult, addAnswer, clearRoundState,
   } = useGroup(workshopId, groupId, currentRound?.id);
   const isCurrentActive = currentRound?.status === "active" || currentRound?.status === "input";
 
@@ -74,6 +83,8 @@ export function WorkshopPage() {
   const [editingAIResult, setEditingAIResult] = useState(false);
   const [aiResultDraft, setAIResultDraft] = useState("");
   const [savingAIResult, setSavingAIResult] = useState(false);
+  const [leaderTransferTarget, setLeaderTransferTarget] = useState<Participant | null>(null);
+  const [transferringLeader, setTransferringLeader] = useState(false);
 
   const handleExpire = useCallback(() => setExpired(true), []);
   const { remaining, minutes, seconds, isRunning, start, reset } = useCountdown(
@@ -86,6 +97,18 @@ export function WorkshopPage() {
     participant?.id ?? null,
     currentRound?.id,
   );
+
+  const exitCompletedWorkshop = useCallback(() => {
+    sessionStorage.removeItem("participant");
+    sessionStorage.setItem("workshop_notice", "研讨已结束，请重新进入或等待新的研讨会。");
+    navigate("/");
+  }, [navigate]);
+
+  useEffect(() => {
+    if (workshop?.status === "completed") {
+      exitCompletedWorkshop();
+    }
+  }, [workshop?.status, exitCompletedWorkshop]);
 
   useEffect(() => {
     sessionStorage.setItem(PANEL_RATIO_KEY, String(panelRatio));
@@ -164,11 +187,17 @@ export function WorkshopPage() {
           reset(0);
           setExpired(true);
         }
-        fetchWorkshop();
+        fetchWorkshop({ silent: true });
         break;
       }
+      case "group_leader_changed":
+        fetchWorkshop({ silent: true });
+        break;
+      case "workshop_completed":
+        exitCompletedWorkshop();
+        break;
     }
-  }, [addAnswer, clearHistory, clearRoundState, fetchAIResult, fetchWorkshop, reset, start]);
+  }, [addAnswer, clearHistory, clearRoundState, exitCompletedWorkshop, fetchAIResult, fetchWorkshop, reset, start]);
 
   useWebSocket({
     workshopId,
@@ -177,17 +206,41 @@ export function WorkshopPage() {
   });
 
   const handleTriggerAI = useCallback(async () => {
-    await triggerAI();
-  }, [triggerAI]);
+    if (workshop?.is_review_mode) return;
+    if (!participant?.is_group_leader) return;
+    await triggerAI(participant.id, participant.session_token);
+  }, [participant, triggerAI, workshop?.is_review_mode]);
 
   const handleSubmitAnswer = useCallback(
     async (questionId: number, _participantId: number, content: string) => {
       if (!participant) throw new Error("请先加入研讨会");
+      if (workshop?.is_review_mode) throw new Error("当前为历史轮次查看模式，不能提交回答");
       if (expired) throw new Error("时间已到，无法继续提交");
-      return submitAnswer(participant.id, questionId, content);
+      return submitAnswer(participant.id, participant.session_token, questionId, content);
     },
-    [expired, participant, submitAnswer],
+    [expired, participant, submitAnswer, workshop?.is_review_mode],
   );
+
+  const handleMemberClick = (member: Participant) => {
+    if (!participant?.is_group_leader) return;
+    if (member.id === participant.id) return;
+    setLeaderTransferTarget(member);
+  };
+
+  const handleConfirmLeaderTransfer = async () => {
+    if (!participant || !leaderTransferTarget) return;
+    setTransferringLeader(true);
+    const updated = await transferLeader(
+      participant.id,
+      participant.session_token,
+      leaderTransferTarget.id,
+    );
+    if (updated) {
+      setLeaderTransferTarget(null);
+      await fetchWorkshop({ silent: true });
+    }
+    setTransferringLeader(false);
+  };
 
   const handleAsk = useCallback(async () => {
     const q = aiQuestion.trim();
@@ -262,8 +315,11 @@ export function WorkshopPage() {
       status: found?.status ?? "locked",
     };
   });
-  const answerDisabled = !isCurrentActive || expired;
-  const canEditAIResult = Boolean(participant?.is_group_leader && aiResult);
+  const isReviewMode = Boolean(workshop.is_review_mode);
+  const answerInputDisabled = !isCurrentActive || expired || isReviewMode;
+  const answerSubmitDisabled = !participant?.is_group_leader;
+  const answerSubmitHint = answerSubmitDisabled ? "仅队长可提交" : undefined;
+  const canEditAIResult = Boolean(participant?.is_group_leader && aiResult && !isReviewMode);
 
   return (
     <div className="h-[calc(100vh-3.5rem)] flex flex-col bg-background">
@@ -328,6 +384,13 @@ export function WorkshopPage() {
           style={{ flexBasis: `${panelRatio * 100}%` }}
         >
           <div className="max-w-4xl mx-auto px-6 py-6 space-y-6">
+            {isReviewMode && (
+              <div className="flex items-center justify-center gap-2 rounded-lg border border-primary/20 bg-primary/5 px-4 py-2 text-sm text-primary">
+                <AlertCircle className="h-4 w-4" />
+                <span>当前为历史轮次查看模式，仅支持查看与 AI 问答，不能继续编辑或提交。</span>
+              </div>
+            )}
+
             {isCurrentActive && isRunning && !expired && (
               <div
                 className={cn(
@@ -398,7 +461,10 @@ export function WorkshopPage() {
                           questionId={question.id}
                           participantId={participant.id}
                           onSubmit={handleSubmitAnswer}
-                          disabled={answerDisabled}
+                          disabled={answerInputDisabled}
+                          submitDisabled={answerSubmitDisabled}
+                          submitHint={answerSubmitHint}
+                          draftKey={`answer-draft:${workshop.id}:${currentRound?.id ?? "no-round"}:${question.id}:${participant.id}`}
                         />
                       ) : (
                         <p className="text-xs text-muted-foreground">请先加入研讨会后再回答</p>
@@ -430,18 +496,45 @@ export function WorkshopPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                {participant ? (
-                  <div className="flex items-center justify-between rounded-md bg-muted/30 px-3 py-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center text-xs font-medium text-primary">
-                        {participant.name.charAt(0)}
-                      </div>
-                      <span className="text-sm truncate">{participant.name}</span>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      {participant.is_group_leader && <Badge variant="default">组长</Badge>}
-                      <Badge variant="outline">第 {participant.group_id} 组</Badge>
-                    </div>
+                {workshop.group_members.length > 0 ? (
+                  <div className="flex gap-3 overflow-x-auto pb-1">
+                    {workshop.group_members.map((member) => {
+                      const isSelf = member.id === participant?.id;
+                      const canTransfer = Boolean(participant?.is_group_leader && !isSelf);
+                      return (
+                        <button
+                          key={member.id}
+                          type="button"
+                          onClick={() => handleMemberClick(member)}
+                          disabled={!canTransfer}
+                          className={cn(
+                            "flex min-w-[74px] flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors",
+                            member.is_group_leader
+                              ? "border-primary bg-primary/10 text-primary"
+                              : "border-border bg-muted/30 text-foreground",
+                            canTransfer && "cursor-pointer hover:border-primary/60 hover:bg-primary/5",
+                            !canTransfer && "cursor-default",
+                          )}
+                          title={canTransfer ? `转移队长给 ${member.name}` : member.name}
+                        >
+                          <div
+                            className={cn(
+                              "flex h-10 w-10 items-center justify-center rounded-full text-sm font-semibold",
+                              member.is_group_leader
+                                ? "bg-primary text-primary-foreground ring-2 ring-primary/25"
+                                : "bg-background text-muted-foreground",
+                            )}
+                          >
+                            {member.name.charAt(0)}
+                          </div>
+                          <span className="max-w-[64px] truncate text-xs font-medium">{member.name}</span>
+                          <div className="flex min-h-5 flex-wrap items-center justify-center gap-1">
+                            {member.is_group_leader && <Badge variant="default" className="px-1.5 py-0 text-[10px]">队长</Badge>}
+                            {isSelf && <Badge variant="outline" className="px-1.5 py-0 text-[10px]">我</Badge>}
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 ) : (
                   <p className="text-sm text-muted-foreground text-center py-4">暂无成员信息</p>
@@ -509,11 +602,14 @@ export function WorkshopPage() {
                   size="sm"
                   className="w-full gap-1.5"
                   onClick={handleTriggerAI}
-                  disabled={aiLoading || !isCurrentActive}
+                  disabled={aiLoading || !isCurrentActive || isReviewMode || !participant?.is_group_leader}
                 >
                   {aiLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
                   {aiLoading ? "生成中..." : "AI 提炼"}
                 </Button>
+                {participant && !participant.is_group_leader && (
+                  <p className="text-xs text-muted-foreground text-center">仅队长可发起 AI 提炼</p>
+                )}
               </CardContent>
             </Card>
 
@@ -574,6 +670,28 @@ export function WorkshopPage() {
           </div>
         </aside>
       </div>
+      <Dialog open={Boolean(leaderTransferTarget)} onOpenChange={(open) => !open && setLeaderTransferTarget(null)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>转移队长</DialogTitle>
+            <DialogDescription>
+              是否将队长转移给 {leaderTransferTarget?.name}？
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setLeaderTransferTarget(null)}
+              disabled={transferringLeader}
+            >
+              取消
+            </Button>
+            <Button onClick={handleConfirmLeaderTransfer} disabled={transferringLeader}>
+              {transferringLeader ? <LoadingSpinner size="sm" /> : "确认转移"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

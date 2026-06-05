@@ -73,7 +73,8 @@ async def _load_workshop(workshop_id: int, db: AsyncSession) -> Workshop:
 
 
 def _build_host_view(w: Workshop) -> WorkshopHostView:
-    groups: dict[int, list] = {1: [], 2: [], 3: [], 4: []}
+    group_count = w.group_count or 4
+    groups: dict[int, list] = {gid: [] for gid in range(1, group_count + 1)}
     for p in w.participants:
         groups.setdefault(p.group_id, []).append(p)
     group_infos = []
@@ -119,7 +120,11 @@ def _build_host_view(w: Workshop) -> WorkshopHostView:
     return WorkshopHostView(
         id=w.id, title=w.title, host_name=w.host_name,
         invite_code=w.invite_code, host_code=w.host_code, kb_admin_code=w.kb_admin_code,
-        current_round=w.current_round, status=w.status, created_at=w.created_at,
+        group_count=group_count,
+        current_round=w.current_round,
+        flow_round_number=w.flow_round_number or w.current_round,
+        is_review_mode=bool(w.is_review_mode),
+        status=w.status, created_at=w.created_at,
         groups=group_infos, rounds=round_infos,
         knowledge_docs=[KnowledgeDocumentOut.model_validate(d) for d in w.knowledge_docs if not d.is_deleted],
     )
@@ -137,6 +142,7 @@ def _build_member_view(w: Workshop, participant: Optional[Participant] = None) -
             questions=[QuestionOut(id=q.id, round_id=q.round_id, content=q.content, order=q.order) for q in rd.questions],
         ))
     p_out = None
+    group_members = []
     if participant:
         p_out = ParticipantWithToken(
             id=participant.id, workshop_id=participant.workshop_id,
@@ -144,11 +150,24 @@ def _build_member_view(w: Workshop, participant: Optional[Participant] = None) -
             is_group_leader=participant.is_group_leader,
             session_token=participant.session_token or "",
         )
+        group_members = [
+            ParticipantOut(
+                id=p.id,
+                workshop_id=p.workshop_id,
+                name=p.name,
+                group_id=p.group_id,
+                is_group_leader=p.is_group_leader,
+            )
+            for p in sorted(w.participants, key=lambda item: item.id)
+            if p.group_id == participant.group_id
+        ]
     return WorkshopMemberView(
         id=w.id, title=w.title, host_name=w.host_name,
-        invite_code=w.invite_code, current_round=w.current_round,
+        invite_code=w.invite_code, group_count=w.group_count or 4, current_round=w.current_round,
+        flow_round_number=w.flow_round_number or w.current_round,
+        is_review_mode=bool(w.is_review_mode),
         status=w.status, created_at=w.created_at,
-        participant=p_out, rounds=rounds_out,
+        participant=p_out, group_members=group_members, rounds=rounds_out,
     )
 
 
@@ -168,7 +187,14 @@ def _round_to_dict(r: Round) -> dict:
 
 @router.post("", response_model=WorkshopCreateResponse, status_code=201)
 async def create_workshop(data: WorkshopCreate, db: AsyncSession = Depends(get_db)):
-    w = Workshop(title=data.title, host_name=data.host_name)
+    w = Workshop(
+        title=data.title,
+        host_name=data.host_name,
+        group_count=data.group_count,
+        current_round=1,
+        flow_round_number=1,
+        is_review_mode=False,
+    )
     db.add(w)
     await db.flush()
 
@@ -189,6 +215,7 @@ async def create_workshop(data: WorkshopCreate, db: AsyncSession = Depends(get_d
     await db.commit()
     return WorkshopCreateResponse(
         id=w.id, title=w.title, host_name=w.host_name,
+        group_count=w.group_count or 4,
         invite_code=w.invite_code, host_code=w.host_code, kb_admin_code=w.kb_admin_code,
         created_at=w.created_at,
     )
@@ -221,9 +248,19 @@ async def get_host_view(workshop_id: int, code: str = Query(...), db: AsyncSessi
 
 
 @router.get("/{workshop_id}", response_model=WorkshopMemberView)
-async def get_workshop(workshop_id: int, db: AsyncSession = Depends(get_db)):
+async def get_workshop(
+    workshop_id: int,
+    participant_id: Optional[int] = Query(default=None),
+    session_token: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
     w = await _load_workshop(workshop_id, db)
-    return _build_member_view(w)
+    participant = None
+    if participant_id is not None and session_token:
+        candidate = next((p for p in w.participants if p.id == participant_id), None)
+        if candidate and candidate.session_token == session_token:
+            participant = candidate
+    return _build_member_view(w, participant)
 
 
 @router.post("/{workshop_id}/join", response_model=ParticipantWithToken)
@@ -235,7 +272,8 @@ async def join_workshop(workshop_id: int, data: WorkshopJoinRequest, db: AsyncSe
         raise HTTPException(status_code=403, detail="Invalid invite code")
 
     # Balanced group assignment
-    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    group_count = w.group_count or 4
+    counts = {gid: 0 for gid in range(1, group_count + 1)}
     for p in w.participants:
         counts[p.group_id] = counts.get(p.group_id, 0) + 1
     min_count = min(counts.values())
@@ -271,19 +309,21 @@ async def unlock_round(
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
 
-    current = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    flow_round = w.flow_round_number or w.current_round
+    current = next((r for r in w.rounds if r.round_number == flow_round), None)
     if not current:
         raise HTTPException(status_code=400, detail="No current round")
 
-    # If current round is already active, advance to next
-    if w.current_round < 4:
+    w.is_review_mode = False
+    if flow_round < 4:
         current.status = RoundStatus.COMPLETED
-        next_rd = next((r for r in w.rounds if r.round_number == w.current_round + 1), None)
+        next_rd = next((r for r in w.rounds if r.round_number == flow_round + 1), None)
         if next_rd:
             next_rd.status = RoundStatus.ACTIVE
             next_rd.timer_started_at = None
             next_rd.timer_phase = None
-            w.current_round += 1
+            w.current_round = flow_round + 1
+            w.flow_round_number = flow_round + 1
             await db.commit()
             w = await _load_workshop(workshop_id, db)
             active_rd = next((r for r in w.rounds if r.round_number == w.current_round), None)
@@ -292,9 +332,45 @@ async def unlock_round(
     else:
         current.status = RoundStatus.COMPLETED
         w.status = WorkshopStatus.COMPLETED
+        w.current_round = flow_round
+        w.flow_round_number = flow_round
         await db.commit()
         w = await _load_workshop(workshop_id, db)
+        await ws_manager.broadcast_workshop_completed(workshop_id)
 
+    return _build_host_view(w)
+
+
+@router.post("/{workshop_id}/previous-round", response_model=WorkshopHostView)
+async def previous_round(
+    workshop_id: int, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="研讨已结束，不能回退轮次")
+    if w.is_review_mode:
+        raise HTTPException(status_code=400, detail="当前已在历史轮次查看模式")
+
+    flow_round = w.flow_round_number or w.current_round
+    if flow_round <= 1:
+        raise HTTPException(status_code=400, detail="第一轮不能回到上一轮")
+
+    review_round_number = flow_round - 1
+    review_round = next((r for r in w.rounds if r.round_number == review_round_number), None)
+    if not review_round:
+        raise HTTPException(status_code=404, detail="上一轮不存在")
+
+    w.current_round = review_round_number
+    w.is_review_mode = True
+    await db.commit()
+    w = await _load_workshop(workshop_id, db)
+    review_round = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    if review_round:
+        await ws_manager.broadcast_round_change(workshop_id, w.current_round, _round_to_dict(review_round))
     return _build_host_view(w)
 
 
@@ -307,6 +383,8 @@ async def start_round_timer(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.is_review_mode:
+        raise HTTPException(status_code=400, detail="当前为历史轮次查看模式，不能开始计时")
 
     current = next((r for r in w.rounds if r.round_number == w.current_round), None)
     if not current:
@@ -338,6 +416,8 @@ async def update_round_settings(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.is_review_mode:
+        raise HTTPException(status_code=400, detail="当前为历史轮次查看模式，不能修改本轮时长")
 
     current = next((r for r in w.rounds if r.round_number == w.current_round), None)
     if not current:

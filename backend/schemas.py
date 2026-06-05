@@ -18,12 +18,14 @@ class APIModel(BaseModel):
 class WorkshopCreate(APIModel):
     title: str = Field(default="领导力共创研讨会", min_length=1, max_length=255)
     host_name: str = Field(..., min_length=1, max_length=100)
+    group_count: int = Field(default=4, ge=1, le=10)
 
 
 class WorkshopCreateResponse(APIModel):
     id: int
     title: str
     host_name: str
+    group_count: int
     invite_code: str
     host_code: str
     kb_admin_code: str
@@ -97,6 +99,7 @@ class QuestionOut(APIModel):
 # ---------- Answer ----------
 class AnswerSubmit(APIModel):
     participant_id: int
+    session_token: str
     question_id: int
     content: str = Field(..., min_length=1)
 
@@ -137,6 +140,18 @@ class GroupResultMemberEdit(APIModel):
     participant_id: int
     session_token: str
     edited_content: str = Field(..., min_length=1)
+
+
+class GroupAITrigger(APIModel):
+    participant_id: int
+    session_token: str
+
+
+class GroupLeaderTransfer(APIModel):
+    workshop_id: int
+    participant_id: int
+    session_token: str
+    new_leader_participant_id: int
 
 
 # ---------- Synthesis Result ----------
@@ -214,10 +229,14 @@ class WorkshopMemberView(APIModel):
     title: str
     host_name: str
     invite_code: str
+    group_count: int
     current_round: int
+    flow_round_number: int
+    is_review_mode: bool
     status: WorkshopStatus
     created_at: datetime
     participant: Optional[ParticipantWithToken] = None
+    group_members: List[ParticipantOut] = []
     rounds: List[RoundOut] = []
 
     model_config = {"from_attributes": True}
@@ -230,7 +249,10 @@ class WorkshopHostView(APIModel):
     invite_code: str
     host_code: str
     kb_admin_code: str
+    group_count: int
     current_round: int
+    flow_round_number: int
+    is_review_mode: bool
     status: WorkshopStatus
     created_at: datetime
     groups: List[GroupInfo] = []

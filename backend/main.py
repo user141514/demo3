@@ -64,7 +64,9 @@ async def websocket_endpoint(
     await ws_manager.connect(workshop_id, websocket, channel=channel)
     try:
         while True:
-            await websocket.receive_text()
+            message = await websocket.receive_text()
+            if message == "ping":
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
         ws_manager.disconnect(workshop_id, websocket)
     except Exception as e:

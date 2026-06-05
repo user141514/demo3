@@ -6,8 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from models import (
-    Workshop, Participant, Round, Question, Answer,
-    GroupRoundResult, SynthesisResult, HostInput, KnowledgeDocument,
+    Workshop, Round, Question, Answer,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,77 +28,99 @@ class ExportService:
         if not workshop:
             raise ValueError(f"Workshop {workshop_id} not found")
 
+        group_count = workshop.group_count or 4
+        groups = {gid: [] for gid in range(1, group_count + 1)}
+        for participant in workshop.participants:
+            groups.setdefault(participant.group_id, []).append(participant)
+
         lines = [
-            f"# {workshop.title} — 领导力共创研讨会完整记录",
+            f"# {workshop.title} - 领导力共创研讨会完整记录",
             "",
             f"**主持人**: {workshop.host_name}",
             f"**邀请码**: {workshop.invite_code}",
             f"**创建时间**: {_local_time(workshop.created_at).strftime('%Y-%m-%d %H:%M')}",
-            f"**状态**: {'进行中' if workshop.status.value == 'active' else '已完成'}",
+            f"**状态**: {'进行中' if workshop.status.value == 'active' else '已结束'}",
+            f"**组数**: {group_count}",
             f"**总轮次**: {len(workshop.rounds)}",
             "",
+            "## 参会人员",
         ]
 
-        # Participants
-        groups = {1: [], 2: [], 3: [], 4: []}
-        for p in workshop.participants:
-            groups.setdefault(p.group_id, []).append(p)
-        lines.append("## 参会人员")
-        for gid in sorted(groups):
-            lines.append(f"### 第{gid}组 ({len(groups[gid])}人)")
-            for p in groups[gid]:
-                leader = " (组长)" if p.is_group_leader else ""
-                lines.append(f"- {p.name}{leader}")
+        for gid in range(1, group_count + 1):
+            members = sorted(groups.get(gid, []), key=lambda item: item.id)
+            lines.append(f"### 第{gid}组 ({len(members)}人)")
+            if members:
+                for participant in members:
+                    leader = " (队长)" if participant.is_group_leader else ""
+                    lines.append(f"- {participant.name}{leader}")
+            else:
+                lines.append("- 本组暂无成员")
             lines.append("")
         lines.append("---\n")
 
-        # Rounds
         for rd in sorted(workshop.rounds, key=lambda r: r.round_number):
-            lines.append(f"# 讨论{self._cn_num(rd.round_number)}：{rd.title}")
+            lines.append(f"# 第{rd.round_number}轮：{rd.title}")
             lines.append(f"**目标**: {rd.objective or '无'}")
-            lines.append(f"**讨论时间**: {rd.discussion_time} 分钟 | **填写时间**: {rd.input_time} 分钟")
+            lines.append(f"**本轮时长**: {rd.discussion_time} 分钟")
             lines.append("")
 
-            # Questions
             for q in rd.questions:
                 lines.append(f"**Q{q.order}**: {q.content}")
             lines.append("")
 
-            # Group answers
-            for gid in sorted(groups):
+            for gid in range(1, group_count + 1):
                 lines.append(f"## 第{gid}组回答")
+                group_has_answer = False
                 for q in rd.questions:
-                    answers = [a for a in q.answers if a.participant and a.participant.group_id == gid]
-                    if answers:
-                        lines.append(f"### {q.content}")
-                        for a in answers:
-                            name = a.participant.name if a.participant else "未知"
-                            lines.append(f"- **{name}**: {a.content}")
-                        lines.append("")
-                if not any(a for q in rd.questions for a in q.answers if a.participant and a.participant.group_id == gid):
-                    lines.append("（本组未提交回答）\n")
+                    answers = [
+                        answer for answer in q.answers
+                        if answer.participant and answer.participant.group_id == gid
+                    ]
+                    if not answers:
+                        continue
+                    group_has_answer = True
+                    lines.append(f"### {q.content}")
+                    for answer in sorted(answers, key=lambda item: item.created_at):
+                        name = answer.participant.name if answer.participant else "未知成员"
+                        lines.append(f"- **{name}**: {answer.content}")
+                    lines.append("")
+                if not group_has_answer:
+                    lines.append("本组暂无提交内容\n")
 
-            # Group AI results
-            for gr in rd.group_results:
-                lines.append(f"## 第{gr.group_id}组 AI 生成结果")
-                if gr.original_content:
-                    lines.append(gr.original_content)
-                if gr.edited_content and gr.edited_content != gr.original_content:
-                    lines.append(f"### 编辑后版本")
-                    lines.append(gr.edited_content)
-                lines.append("")
+            for gid in range(1, group_count + 1):
+                group_results = [result for result in rd.group_results if result.group_id == gid]
+                lines.append(f"## 第{gid}组 AI 提炼结果")
+                if not group_results:
+                    lines.append("本组暂无提交内容\n")
+                    continue
+                for result in sorted(group_results, key=lambda item: item.created_at):
+                    if result.original_content:
+                        lines.append("### 原始 AI 提炼结果")
+                        lines.append(result.original_content)
+                    if result.edited_content:
+                        lines.append("### 编辑后的 AI 提炼结果")
+                        lines.append(result.edited_content)
+                    if not result.original_content and not result.edited_content:
+                        lines.append("本组暂无提交内容")
+                    lines.append("")
 
-            # Synthesis
-            for sr in rd.synthesis_results:
-                lines.append("## AI 综合四组结果")
-                if sr.original_content:
-                    lines.append(sr.original_content)
-                if sr.edited_content and sr.edited_content != sr.original_content:
-                    lines.append("### 编辑后版本")
-                    lines.append(sr.edited_content)
-                lines.append("")
+            if rd.synthesis_results:
+                for sr in rd.synthesis_results:
+                    lines.append("## 综合提炼结果")
+                    if sr.original_content:
+                        lines.append(sr.original_content)
+                    if sr.edited_content:
+                        lines.append("### 编辑后的综合提炼结果")
+                        lines.append(sr.edited_content)
+                    if not sr.original_content and not sr.edited_content:
+                        lines.append("暂无综合提炼结果")
+                    if sr.validation_error:
+                        lines.append(f"失败原因：{sr.validation_error}")
+                    lines.append("")
+            else:
+                lines.append("## 综合提炼结果")
+                lines.append("暂无综合提炼结果\n")
 
-            # Host input
             for hi in rd.host_inputs:
                 lines.append("## 主持人输入")
                 lines.append(hi.content)
@@ -107,12 +128,14 @@ class ExportService:
 
             lines.append("---\n")
 
-        # Knowledge base summary
-        docs = [d for d in workshop.knowledge_docs if not d.is_deleted]
+        docs = [doc for doc in workshop.knowledge_docs if not doc.is_deleted]
         if docs:
             lines.append("## 知识库文件清单")
-            for d in docs:
-                lines.append(f"- {d.original_filename} ({d.file_size} bytes, {d.chunk_count} chunks, {d.embedding_model})")
+            for doc in docs:
+                lines.append(
+                    f"- {doc.original_filename} ({doc.file_size} bytes, "
+                    f"{doc.chunk_count} chunks, {doc.embedding_model})"
+                )
             lines.append("")
 
         tz = datetime.now(timezone.utc).astimezone()
@@ -139,7 +162,3 @@ class ExportService:
             .where(Workshop.id == workshop_id)
         )
         return result.scalar_one_or_none()
-
-    @staticmethod
-    def _cn_num(n: int) -> str:
-        return ["零", "一", "二", "三", "四"][n] if 0 <= n <= 4 else str(n)

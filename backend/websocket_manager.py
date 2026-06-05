@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Set
+from typing import Dict, List, Optional, Set
 
 from fastapi import WebSocket
 
@@ -68,10 +68,41 @@ class WebSocketManager:
         await self.broadcast_to_group(workshop_id, group_id, msg)
         await self.broadcast_to_host(workshop_id, msg)
 
+    async def broadcast_ai_result_status(
+        self,
+        workshop_id: int,
+        group_id: int,
+        round_number: int,
+        status: str,
+        validation_error: Optional[str],
+        updated_at: Optional[str],
+    ):
+        msg = {
+            "type": "ai_result_status",
+            "data": {
+                "group_id": group_id,
+                "round_number": round_number,
+                "status": status,
+                "validation_error": validation_error,
+                "updated_at": updated_at,
+            },
+        }
+        await self.broadcast_to_group(workshop_id, group_id, msg)
+        await self.broadcast_to_host(workshop_id, msg)
+
+    async def broadcast_group_leader_changed(self, workshop_id: int, group_id: int, members: List[dict]):
+        msg = {"type": "group_leader_changed", "data": {"group_id": group_id, "members": members}}
+        await self.broadcast_to_group(workshop_id, group_id, msg)
+        await self.broadcast_to_host(workshop_id, msg)
+
     async def broadcast_synthesis_ready(self, workshop_id: int, round_number: int, result_data: dict):
         msg = {"type": "synthesis_ready", "data": {"round_number": round_number, **result_data}}
         await self.broadcast_to_all(workshop_id, msg)
 
     async def broadcast_timer(self, workshop_id: int, seconds_remaining: int, phase: str):
         msg = {"type": "timer", "data": {"seconds_remaining": seconds_remaining, "phase": phase}}
+        await self.broadcast_to_all(workshop_id, msg)
+
+    async def broadcast_workshop_completed(self, workshop_id: int):
+        msg = {"type": "workshop_completed", "data": {"workshop_id": workshop_id}}
         await self.broadcast_to_all(workshop_id, msg)
