@@ -1,4 +1,6 @@
 import logging
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,13 +9,13 @@ from sqlalchemy.orm import selectinload
 from database import get_db
 from dependencies import get_ws_manager, get_ai_service, get_export_service
 from models import (
-    Workshop, Participant, Round, Question, GroupRoundResult,
+    Workshop, Participant, Round, Question, Answer, GroupRoundResult,
     SynthesisResult, HostInput, KnowledgeDocument, WorkshopStatus, RoundStatus,
     GroupResultStatus,
 )
 from schemas import (
     WorkshopCreate, WorkshopCreateResponse, WorkshopMemberView, WorkshopHostView,
-    WorkshopJoinRequest, ParticipantOut, ParticipantWithToken, RoundOut, QuestionOut,
+    WorkshopJoinRequest, ParticipantOut, ParticipantWithToken, RoundOut, QuestionOut, AnswerOut,
     GroupInfo, RoundInfo, GroupRoundResultOut, SynthesisResultOut, HostInputOut,
     HostInputCreate, RoundSettingsUpdate, GroupResultEdit, SynthesisResultEdit,
     KnowledgeDocumentOut, ExportResponse,
@@ -31,6 +33,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/workshops", tags=["workshops"])
 
 
+def _as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _round_timer_remaining(r: Round) -> Optional[int]:
+    if not r.timer_started_at or not r.timer_phase:
+        return None
+    duration_minutes = r.discussion_time
+    elapsed = int((datetime.now(timezone.utc) - _as_utc(r.timer_started_at)).total_seconds())
+    return max(duration_minutes * 60 - elapsed, 0)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 async def _load_workshop(workshop_id: int, db: AsyncSession) -> Workshop:
@@ -38,7 +56,7 @@ async def _load_workshop(workshop_id: int, db: AsyncSession) -> Workshop:
         select(Workshop)
         .options(
             selectinload(Workshop.participants),
-            selectinload(Workshop.rounds).selectinload(Round.questions),
+            selectinload(Workshop.rounds).selectinload(Round.questions).selectinload(Question.answers).selectinload(Answer.participant),
             selectinload(Workshop.rounds).selectinload(Round.group_results),
             selectinload(Workshop.rounds).selectinload(Round.synthesis_results),
             selectinload(Workshop.rounds).selectinload(Round.host_inputs),
@@ -72,11 +90,27 @@ def _build_host_view(w: Workshop) -> WorkshopHostView:
     for rd in sorted(w.rounds, key=lambda r: r.round_number):
         syn = next((sr for sr in rd.synthesis_results), None)
         hi = next((h for h in rd.host_inputs), None)
+        answers = []
+        for q in rd.questions:
+            for a in q.answers:
+                p = a.participant
+                answers.append(AnswerOut(
+                    id=a.id,
+                    question_id=a.question_id,
+                    participant_id=a.participant_id,
+                    content=a.content,
+                    created_at=a.created_at,
+                    participant_name=p.name if p else None,
+                    group_id=p.group_id if p else None,
+                ))
         round_infos.append(RoundInfo(
             id=rd.id, round_number=rd.round_number, title=rd.title,
             objective=rd.objective, status=rd.status,
             discussion_time=rd.discussion_time, input_time=rd.input_time,
+            timer_started_at=rd.timer_started_at, timer_phase=rd.timer_phase,
+            timer_remaining_seconds=_round_timer_remaining(rd),
             questions=[QuestionOut(id=q.id, round_id=q.round_id, content=q.content, order=q.order) for q in rd.questions],
+            answers=sorted(answers, key=lambda a: a.created_at),
             group_results=[GroupRoundResultOut.model_validate(gr) for gr in rd.group_results],
             synthesis=SynthesisResultOut.model_validate(syn) if syn else None,
             host_input=HostInputOut.model_validate(hi) if hi else None,
@@ -91,13 +125,15 @@ def _build_host_view(w: Workshop) -> WorkshopHostView:
     )
 
 
-def _build_member_view(w: Workshop, participant: Participant | None = None) -> WorkshopMemberView:
+def _build_member_view(w: Workshop, participant: Optional[Participant] = None) -> WorkshopMemberView:
     rounds_out = []
     for rd in sorted(w.rounds, key=lambda r: r.round_number):
         rounds_out.append(RoundOut(
             id=rd.id, workshop_id=rd.workshop_id, round_number=rd.round_number,
             title=rd.title, objective=rd.objective, status=rd.status,
             discussion_time=rd.discussion_time, input_time=rd.input_time,
+            timer_started_at=rd.timer_started_at, timer_phase=rd.timer_phase,
+            timer_remaining_seconds=_round_timer_remaining(rd),
             questions=[QuestionOut(id=q.id, round_id=q.round_id, content=q.content, order=q.order) for q in rd.questions],
         ))
     p_out = None
@@ -121,6 +157,9 @@ def _round_to_dict(r: Round) -> dict:
         "id": r.id, "round_number": r.round_number, "title": r.title,
         "objective": r.objective, "status": r.status.value if r.status else "locked",
         "discussion_time": r.discussion_time, "input_time": r.input_time,
+        "timer_started_at": _as_utc(r.timer_started_at).isoformat().replace("+00:00", "Z") if r.timer_started_at else None,
+        "timer_phase": r.timer_phase,
+        "timer_remaining_seconds": _round_timer_remaining(r),
         "questions": [{"id": q.id, "content": q.content, "order": q.order} for q in r.questions],
     }
 
@@ -140,6 +179,7 @@ async def create_workshop(data: WorkshopCreate, db: AsyncSession = Depends(get_d
             title=rd["title"], objective=rd["objective"],
             status=st, discussion_time=rd["discussion_time"],
             input_time=rd["input_time"],
+            timer_started_at=None, timer_phase=None,
         )
         db.add(r)
         await db.flush()
@@ -241,6 +281,8 @@ async def unlock_round(
         next_rd = next((r for r in w.rounds if r.round_number == w.current_round + 1), None)
         if next_rd:
             next_rd.status = RoundStatus.ACTIVE
+            next_rd.timer_started_at = None
+            next_rd.timer_phase = None
             w.current_round += 1
             await db.commit()
             w = await _load_workshop(workshop_id, db)
@@ -256,6 +298,38 @@ async def unlock_round(
     return _build_host_view(w)
 
 
+@router.post("/{workshop_id}/timer/start", response_model=WorkshopHostView)
+async def start_round_timer(
+    workshop_id: int, code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+
+    current = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    if not current:
+        raise HTTPException(status_code=400, detail="No current round")
+    if current.status not in (RoundStatus.ACTIVE, RoundStatus.INPUT):
+        raise HTTPException(status_code=400, detail="Current round is not timer-enabled")
+
+    current.timer_started_at = datetime.now(timezone.utc)
+    current.timer_phase = current.status.value
+    await db.commit()
+
+    w = await _load_workshop(workshop_id, db)
+    current = next((r for r in w.rounds if r.round_number == w.current_round), None)
+    if current:
+        await ws_manager.broadcast_timer(
+            workshop_id,
+            _round_timer_remaining(current) or 0,
+            current.timer_phase or current.status.value,
+        )
+        await ws_manager.broadcast_round_change(workshop_id, w.current_round, _round_to_dict(current))
+    return _build_host_view(w)
+
+
 @router.post("/{workshop_id}/round-settings", response_model=WorkshopHostView)
 async def update_round_settings(
     workshop_id: int, data: RoundSettingsUpdate, code: str = Query(...),
@@ -268,10 +342,10 @@ async def update_round_settings(
     current = next((r for r in w.rounds if r.round_number == w.current_round), None)
     if not current:
         raise HTTPException(status_code=400, detail="No current round")
-    if data.discussion_time is not None:
-        current.discussion_time = data.discussion_time
-    if data.input_time is not None:
-        current.input_time = data.input_time
+    if data.discussion_time is not None or data.input_time is not None:
+        unified_time = data.discussion_time if data.discussion_time is not None else data.input_time
+        current.discussion_time = unified_time
+        current.input_time = unified_time
     await db.commit()
     return _build_host_view(await _load_workshop(workshop_id, db))
 

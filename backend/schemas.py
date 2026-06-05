@@ -1,16 +1,26 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from models import WorkshopStatus, RoundStatus, GroupResultStatus
 
 
+def _serialize_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class APIModel(BaseModel):
+    model_config = {"json_encoders": {datetime: _serialize_datetime}}
+
+
 # ---------- Workshop ----------
-class WorkshopCreate(BaseModel):
+class WorkshopCreate(APIModel):
     title: str = Field(default="领导力共创研讨会", min_length=1, max_length=255)
     host_name: str = Field(..., min_length=1, max_length=100)
 
 
-class WorkshopCreateResponse(BaseModel):
+class WorkshopCreateResponse(APIModel):
     id: int
     title: str
     host_name: str
@@ -22,27 +32,27 @@ class WorkshopCreateResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class ValidateHostRequest(BaseModel):
+class ValidateHostRequest(APIModel):
     host_code: str
 
 
-class ValidateInviteRequest(BaseModel):
+class ValidateInviteRequest(APIModel):
     invite_code: str
 
 
-class ValidateResponse(BaseModel):
+class ValidateResponse(APIModel):
     valid: bool
     workshop_id: Optional[int] = None
     workshop_title: Optional[str] = None
 
 
-class WorkshopJoinRequest(BaseModel):
+class WorkshopJoinRequest(APIModel):
     name: str = Field(..., min_length=1, max_length=100)
     invite_code: str
 
 
 # ---------- Participant ----------
-class ParticipantOut(BaseModel):
+class ParticipantOut(APIModel):
     id: int
     workshop_id: int
     name: str
@@ -57,7 +67,7 @@ class ParticipantWithToken(ParticipantOut):
 
 
 # ---------- Round ----------
-class RoundOut(BaseModel):
+class RoundOut(APIModel):
     id: int
     workshop_id: int
     round_number: int
@@ -66,13 +76,16 @@ class RoundOut(BaseModel):
     status: RoundStatus
     discussion_time: int
     input_time: int
+    timer_started_at: Optional[datetime] = None
+    timer_phase: Optional[str] = None
+    timer_remaining_seconds: Optional[int] = None
     questions: List["QuestionOut"] = []
 
     model_config = {"from_attributes": True}
 
 
 # ---------- Question ----------
-class QuestionOut(BaseModel):
+class QuestionOut(APIModel):
     id: int
     round_id: int
     content: str
@@ -82,13 +95,13 @@ class QuestionOut(BaseModel):
 
 
 # ---------- Answer ----------
-class AnswerSubmit(BaseModel):
+class AnswerSubmit(APIModel):
     participant_id: int
     question_id: int
     content: str = Field(..., min_length=1)
 
 
-class AnswerOut(BaseModel):
+class AnswerOut(APIModel):
     id: int
     question_id: int
     participant_id: int
@@ -101,7 +114,7 @@ class AnswerOut(BaseModel):
 
 
 # ---------- Group Round Result ----------
-class GroupRoundResultOut(BaseModel):
+class GroupRoundResultOut(APIModel):
     id: int
     round_id: int
     group_id: int
@@ -116,18 +129,25 @@ class GroupRoundResultOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class GroupResultEdit(BaseModel):
+class GroupResultEdit(APIModel):
     edited_content: str
 
 
+class GroupResultMemberEdit(APIModel):
+    participant_id: int
+    session_token: str
+    edited_content: str = Field(..., min_length=1)
+
+
 # ---------- Synthesis Result ----------
-class SynthesisResultOut(BaseModel):
+class SynthesisResultOut(APIModel):
     id: int
     workshop_id: int
     round_id: int
     status: GroupResultStatus
     original_content: Optional[str] = None
     edited_content: Optional[str] = None
+    validation_error: Optional[str] = None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -135,17 +155,17 @@ class SynthesisResultOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class SynthesisResultEdit(BaseModel):
+class SynthesisResultEdit(APIModel):
     edited_content: str
 
 
 # ---------- Host Input ----------
-class HostInputCreate(BaseModel):
+class HostInputCreate(APIModel):
     round_id: int
     content: str = Field(..., min_length=1)
 
 
-class HostInputOut(BaseModel):
+class HostInputOut(APIModel):
     id: int
     workshop_id: int
     round_id: int
@@ -157,20 +177,20 @@ class HostInputOut(BaseModel):
 
 
 # ---------- Round Settings ----------
-class RoundSettingsUpdate(BaseModel):
+class RoundSettingsUpdate(APIModel):
     discussion_time: Optional[int] = Field(default=None, ge=1, le=120)
-    input_time: Optional[int] = Field(default=None, ge=1, le=60)
+    input_time: Optional[int] = Field(default=None, ge=1, le=120)
 
 
 # ---------- Group Info (for host dashboard) ----------
-class GroupInfo(BaseModel):
+class GroupInfo(APIModel):
     group_id: int
     participant_count: int
     leader_name: Optional[str] = None
     members: List[ParticipantOut] = []
 
 
-class RoundInfo(BaseModel):
+class RoundInfo(APIModel):
     id: int
     round_number: int
     title: str
@@ -178,14 +198,18 @@ class RoundInfo(BaseModel):
     status: RoundStatus
     discussion_time: int
     input_time: int
+    timer_started_at: Optional[datetime] = None
+    timer_phase: Optional[str] = None
+    timer_remaining_seconds: Optional[int] = None
     questions: List[QuestionOut] = []
+    answers: List[AnswerOut] = []
     group_results: List[GroupRoundResultOut] = []
     synthesis: Optional[SynthesisResultOut] = None
     host_input: Optional[HostInputOut] = None
 
 
 # ---------- Workshop Views ----------
-class WorkshopMemberView(BaseModel):
+class WorkshopMemberView(APIModel):
     id: int
     title: str
     host_name: str
@@ -199,7 +223,7 @@ class WorkshopMemberView(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class WorkshopHostView(BaseModel):
+class WorkshopHostView(APIModel):
     id: int
     title: str
     host_name: str
@@ -217,11 +241,11 @@ class WorkshopHostView(BaseModel):
 
 
 # ---------- Knowledge Base ----------
-class ValidateAdminRequest(BaseModel):
+class ValidateAdminRequest(APIModel):
     admin_code: str
 
 
-class KnowledgeDocumentOut(BaseModel):
+class KnowledgeDocumentOut(APIModel):
     id: int
     workshop_id: int
     original_filename: str
@@ -237,13 +261,14 @@ class KnowledgeDocumentOut(BaseModel):
 
 
 # ---------- AI QA ----------
-class AIQuestionSubmit(BaseModel):
+class AIQuestionSubmit(APIModel):
     participant_id: int
     question: str = Field(..., min_length=1)
 
 
-class AIQuestionOut(BaseModel):
+class AIQuestionOut(APIModel):
     id: int
+    round_id: Optional[int] = None
     question: str
     answer: Optional[str] = None
     created_at: datetime
@@ -252,12 +277,12 @@ class AIQuestionOut(BaseModel):
 
 
 # ---------- WebSocket ----------
-class WSMessage(BaseModel):
+class WSMessage(APIModel):
     type: str
     data: dict
 
 
 # ---------- Markdown Export ----------
-class ExportResponse(BaseModel):
+class ExportResponse(APIModel):
     markdown: str
     filename: str

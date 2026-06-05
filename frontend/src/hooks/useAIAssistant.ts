@@ -2,7 +2,7 @@ import { useState, useCallback } from "react";
 import { aiApi } from "@/services/api";
 import type { AIQuestion } from "@/types";
 
-export function useAIAssistant(workshopId: number | null, participantId: number | null) {
+export function useAIAssistant(workshopId: number | null, participantId: number | null, roundId?: number | null) {
   const [history, setHistory] = useState<AIQuestion[]>([]);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -28,7 +28,12 @@ export function useAIAssistant(workshopId: number | null, participantId: number 
     try {
       setHistory(await aiApi.getHistory(workshopId, participantId));
     } catch { /* ignore */ }
-  }, [workshopId, participantId]);
+  }, [workshopId, participantId, roundId]);
 
-  return { history, asking, error, ask, fetchHistory };
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+    setError(null);
+  }, []);
+
+  return { history, asking, error, ask, fetchHistory, clearHistory };
 }

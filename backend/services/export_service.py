@@ -13,6 +13,12 @@ from models import (
 logger = logging.getLogger(__name__)
 
 
+def _local_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone()
+
+
 class ExportService:
 
     def __init__(self, db: AsyncSession):
@@ -28,7 +34,7 @@ class ExportService:
             "",
             f"**主持人**: {workshop.host_name}",
             f"**邀请码**: {workshop.invite_code}",
-            f"**创建时间**: {workshop.created_at.strftime('%Y-%m-%d %H:%M')}",
+            f"**创建时间**: {_local_time(workshop.created_at).strftime('%Y-%m-%d %H:%M')}",
             f"**状态**: {'进行中' if workshop.status.value == 'active' else '已完成'}",
             f"**总轮次**: {len(workshop.rounds)}",
             "",

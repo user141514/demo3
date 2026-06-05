@@ -1,5 +1,4 @@
 import { Users } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import type { Participant } from "@/types";
@@ -7,18 +6,6 @@ import type { Participant } from "@/types";
 interface ParticipantListProps {
   participants: Participant[];
 }
-
-const roleLabels: Record<string, string> = {
-  senior: "高管",
-  middle: "中层",
-  junior: "基层",
-};
-
-const roleVariants: Record<string, "senior" | "middle" | "junior"> = {
-  senior: "senior",
-  middle: "middle",
-  junior: "junior",
-};
 
 export function ParticipantList({ participants }: ParticipantListProps) {
   if (participants.length === 0) {
@@ -50,9 +37,9 @@ export function ParticipantList({ participants }: ParticipantListProps) {
                   </div>
                   <span className="text-sm">{p.name}</span>
                 </div>
-                <Badge variant={roleVariants[p.role] || "outline"}>
-                  {roleLabels[p.role] || p.role}
-                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {p.is_group_leader ? "组长" : `第 ${p.group_id} 组`}
+                </span>
               </div>
               {index < participants.length - 1 && (
                 <Separator className="my-0.5" />

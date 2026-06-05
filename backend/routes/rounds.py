@@ -1,5 +1,6 @@
 import logging
-from typing import List
+from typing import List, Optional
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,9 +10,12 @@ from database import get_db
 from dependencies import get_ws_manager, get_ai_service
 from models import (
     Round, Question, Answer, Participant, GroupRoundResult,
-    SynthesisResult, GroupResultStatus, Workshop,
+    SynthesisResult, GroupResultStatus, Workshop, HostInput,
 )
-from schemas import AnswerSubmit, AnswerOut, QuestionOut, GroupRoundResultOut, SynthesisResultOut
+from schemas import (
+    AnswerSubmit, AnswerOut, QuestionOut, GroupRoundResultOut,
+    SynthesisResultOut, GroupResultEdit, GroupResultMemberEdit,
+)
 from services.ai_service import DeepSeekService
 from websocket_manager import WebSocketManager
 
@@ -20,17 +24,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["rounds"])
 
 
+def _as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _timer_remaining_seconds(rd: Round) -> Optional[int]:
+    if not rd.timer_started_at:
+        return None
+    elapsed = int((datetime.now(timezone.utc) - _as_utc(rd.timer_started_at)).total_seconds())
+    return max((rd.discussion_time or 0) * 60 - elapsed, 0)
+
+
+def _is_timer_expired(rd: Round) -> bool:
+    remaining = _timer_remaining_seconds(rd)
+    return remaining is not None and remaining <= 0
+
+
 # ── group question/answer endpoints ─────────────────────────────────────
 
 @router.get("/groups/{group_id}/questions", response_model=List[QuestionOut])
 async def get_group_questions(
     group_id: int, workshop_id: int = Query(...), db: AsyncSession = Depends(get_db),
 ):
+    w = await db.get(Workshop, workshop_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workshop not found")
     result = await db.execute(
         select(Round).where(
             Round.workshop_id == workshop_id,
-            Round.status.in_(["active", "input", "closing"]),
-        ).order_by(Round.round_number).limit(1)
+            Round.round_number == w.current_round,
+        )
     )
     active_round = result.scalar_one_or_none()
     if not active_round:
@@ -55,6 +82,13 @@ async def submit_group_answer(
     question = await db.get(Question, data.question_id)
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
+    rd = await db.get(Round, question.round_id)
+    if not rd:
+        raise HTTPException(status_code=404, detail="Round not found")
+    if rd.status not in ("active", "input"):
+        raise HTTPException(status_code=400, detail="Round is not accepting answers")
+    if _is_timer_expired(rd):
+        raise HTTPException(status_code=400, detail="Time is up; answers are closed")
 
     answer = Answer(question_id=data.question_id, participant_id=data.participant_id, content=data.content)
     db.add(answer)
@@ -66,9 +100,7 @@ async def submit_group_answer(
         content=answer.content, created_at=answer.created_at,
         participant_name=participant.name, group_id=participant.group_id,
     )
-    rd = await db.get(Round, question.round_id)
-    if rd:
-        await ws_manager.broadcast_new_answer(rd.workshop_id, group_id, answer_out.model_dump())
+    await ws_manager.broadcast_new_answer(rd.workshop_id, group_id, answer_out.model_dump())
     return answer_out
 
 
@@ -76,11 +108,14 @@ async def submit_group_answer(
 async def get_group_answers(
     group_id: int, workshop_id: int = Query(...), db: AsyncSession = Depends(get_db),
 ):
+    w = await db.get(Workshop, workshop_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workshop not found")
     result = await db.execute(
         select(Round).where(
             Round.workshop_id == workshop_id,
-            Round.status.in_(["active", "input", "closing", "completed"]),
-        ).order_by(Round.round_number).limit(1)
+            Round.round_number == w.current_round,
+        )
     )
     active_round = result.scalar_one_or_none()
     if not active_round:
@@ -171,8 +206,8 @@ async def trigger_group_ai(
         raise HTTPException(status_code=400, detail="No answers from this group")
 
     answers_text = ""
-    for a, p, q in rows:
-        answers_text += f"**{q.content}**\n[{p.name}]: {a.content}\n\n"
+    for a, _p, q in rows:
+        answers_text += f"**{q.content}**\n回答：{a.content}\n\n"
 
     try:
         round_num = active_round.round_number
@@ -229,6 +264,56 @@ async def get_group_ai_result(
     return GroupRoundResultOut.model_validate(gr)
 
 
+@router.put("/groups/{group_id}/ai-result", response_model=GroupRoundResultOut)
+async def edit_group_ai_result(
+    group_id: int,
+    data: GroupResultMemberEdit,
+    workshop_id: int = Query(...),
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    participant = await db.get(Participant, data.participant_id)
+    if (
+        not participant
+        or participant.workshop_id != workshop_id
+        or participant.group_id != group_id
+        or participant.session_token != data.session_token
+    ):
+        raise HTTPException(status_code=403, detail="Invalid participant")
+    if not participant.is_group_leader:
+        raise HTTPException(status_code=403, detail="Only group leader can edit AI result")
+
+    w = await db.get(Workshop, workshop_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+
+    result = await db.execute(
+        select(Round).where(Round.workshop_id == workshop_id, Round.round_number == w.current_round)
+    )
+    active_round = result.scalar_one_or_none()
+    if not active_round:
+        raise HTTPException(status_code=404, detail="No active round")
+
+    result = await db.execute(
+        select(GroupRoundResult).where(
+            GroupRoundResult.round_id == active_round.id,
+            GroupRoundResult.group_id == group_id,
+        ).order_by(GroupRoundResult.created_at.desc()).limit(1)
+    )
+    gr = result.scalar_one_or_none()
+    if not gr:
+        raise HTTPException(status_code=404, detail="No result yet")
+
+    gr.edited_content = data.edited_content
+    gr.status = GroupResultStatus.EDITED
+    await db.commit()
+    await db.refresh(gr)
+
+    out = GroupRoundResultOut.model_validate(gr)
+    await ws_manager.broadcast_result_ready(workshop_id, group_id, active_round.round_number, out.model_dump())
+    return out
+
+
 # ── synthesis ───────────────────────────────────────────────────────────
 
 @router.post("/rounds/{round_id}/synthesize", response_model=SynthesisResultOut)
@@ -260,6 +345,7 @@ async def trigger_synthesis(
         db.add(sr)
     else:
         sr.status = GroupResultStatus.PROCESSING
+        sr.validation_error = None
     await db.commit()
     await db.refresh(sr)
 
@@ -277,10 +363,12 @@ async def trigger_synthesis(
 
         sr.original_content = content
         sr.version = version
+        sr.validation_error = err
         sr.status = GroupResultStatus.VALIDATION_FAILED if err else GroupResultStatus.READY
     except Exception as e:
         logger.error(f"Synthesis failed: {e}")
         sr.status = GroupResultStatus.VALIDATION_FAILED
+        sr.validation_error = str(e)
 
     await db.commit()
     await db.refresh(sr)

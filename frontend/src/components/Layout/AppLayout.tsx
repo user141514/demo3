@@ -6,7 +6,7 @@ export function AppLayout() {
     <div className="min-h-screen flex flex-col bg-background">
       <header className="border-b bg-card shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-14">
+          <div className="flex items-center justify-start h-14">
             <Link
               to="/"
               className="flex items-center gap-2 hover:opacity-80 transition-opacity"

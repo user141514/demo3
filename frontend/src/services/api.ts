@@ -14,7 +14,20 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const errorText = await res.text().catch(() => "Unknown error");
-    throw new Error(`API error ${res.status}: ${errorText}`);
+    let message = errorText;
+    try {
+      const parsed = JSON.parse(errorText);
+      if (typeof parsed.detail === "string") {
+        message = parsed.detail;
+      } else if (Array.isArray(parsed.detail)) {
+        message = parsed.detail
+          .map((item: { msg?: string }) => item.msg ?? JSON.stringify(item))
+          .join("; ");
+      }
+    } catch {
+      // Keep raw response text when it is not JSON.
+    }
+    throw new Error(`API error ${res.status}: ${message}`);
   }
   return res.json() as Promise<T>;
 }
@@ -63,6 +76,11 @@ export const workshopApi = {
       body: JSON.stringify({ discussion_time, input_time }),
     }),
 
+  startTimer: (id: number, code: string) =>
+    request<WorkshopHostView>(`/workshops/${id}/timer/start?code=${encodeURIComponent(code)}`, {
+      method: "POST",
+    }),
+
   submitHostInput: (id: number, code: string, round_id: number, content: string) =>
     request<HostInput>(`/workshops/${id}/host-input?code=${encodeURIComponent(code)}`, {
       method: "POST",
@@ -107,6 +125,18 @@ export const groupApi = {
 
   getAIResult: (groupId: number, workshopId: number) =>
     request<GroupRoundResult>(`/groups/${groupId}/ai-result?workshop_id=${workshopId}`),
+
+  editAIResult: (
+    groupId: number,
+    workshopId: number,
+    participant_id: number,
+    session_token: string,
+    edited_content: string,
+  ) =>
+    request<GroupRoundResult>(`/groups/${groupId}/ai-result?workshop_id=${workshopId}`, {
+      method: "PUT",
+      body: JSON.stringify({ participant_id, session_token, edited_content }),
+    }),
 
   synthesize: (roundId: number) =>
     request<SynthesisResult>(`/rounds/${roundId}/synthesize`, {

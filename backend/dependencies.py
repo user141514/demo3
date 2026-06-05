@@ -1,4 +1,4 @@
-from fastapi import Depends, Request
+from fastapi import Depends, Request, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -10,6 +10,10 @@ from services.export_service import ExportService
 
 def get_ws_manager(request: Request) -> WebSocketManager:
     return request.app.state.ws_manager
+
+
+def get_ws_manager_from_ws(websocket: WebSocket) -> WebSocketManager:
+    return websocket.app.state.ws_manager
 
 
 def get_ai_service(request: Request) -> DeepSeekService:

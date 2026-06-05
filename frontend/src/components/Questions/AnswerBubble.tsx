@@ -1,21 +1,8 @@
-import { Badge } from "@/components/ui/badge";
 import type { Answer } from "@/types";
 
 interface AnswerBubbleProps {
   answer: Answer;
 }
-
-const roleLabels: Record<string, string> = {
-  senior: "高管",
-  middle: "中层",
-  junior: "基层",
-};
-
-const roleVariants: Record<string, "senior" | "middle" | "junior"> = {
-  senior: "senior",
-  middle: "middle",
-  junior: "junior",
-};
 
 export function AnswerBubble({ answer }: AnswerBubbleProps) {
   const displayName = answer.participant_name || "匿名";
@@ -34,12 +21,6 @@ export function AnswerBubble({ answer }: AnswerBubbleProps) {
           <span className="text-sm font-medium text-foreground">
             {displayName}
           </span>
-          <Badge
-            variant={roleVariants[answer.participant_role] || "outline"}
-            className="text-[10px] px-1.5 py-0"
-          >
-            {roleLabels[answer.participant_role] || answer.participant_role}
-          </Badge>
           <span className="text-xs text-muted-foreground ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
             {time}
           </span>

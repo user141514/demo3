@@ -23,6 +23,9 @@ export interface Round {
   status: RoundStatus;
   discussion_time: number;
   input_time: number;
+  timer_started_at: string | null;
+  timer_phase: string | null;
+  timer_remaining_seconds: number | null;
   questions: Question[];
 }
 
@@ -63,9 +66,18 @@ export interface SynthesisResult {
   status: GroupResultStatus;
   original_content: string | null;
   edited_content: string | null;
+  validation_error: string | null;
   version: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface Summary {
+  id: number;
+  round_id: number;
+  content: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface HostInput {
@@ -92,7 +104,11 @@ export interface RoundInfo {
   status: RoundStatus;
   discussion_time: number;
   input_time: number;
+  timer_started_at: string | null;
+  timer_phase: string | null;
+  timer_remaining_seconds: number | null;
   questions: Question[];
+  answers: Answer[];
   group_results: GroupRoundResult[];
   synthesis: SynthesisResult | null;
   host_input: HostInput | null;
@@ -113,6 +129,7 @@ export interface KnowledgeDocument {
 
 export interface AIQuestion {
   id: number;
+  round_id: number | null;
   question: string;
   answer: string | null;
   created_at: string;
