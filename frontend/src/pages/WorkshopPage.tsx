@@ -38,11 +38,15 @@ import {
   Save,
   X,
   GripVertical,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { WSMessage, Answer, Participant, Round } from "@/types";
 
 const PANEL_RATIO_KEY = "workshop-member-panel-ratio";
+const AI_RESULT_COLLAPSED_KEY = "workshop-member-ai-result-collapsed";
+const AI_QA_HEIGHT_KEY = "workshop-member-ai-qa-height";
 const ROUND_LABELS = ["关键领导力维度", "领导力维度分层", "领导力行为描述", "领导力应用场景"];
 
 const STATUS_CONFIG: Record<string, { label: string; icon: ReactNode }> = {
@@ -57,11 +61,20 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
+function aiResultStatusLabel(status?: string) {
+  if (status === "edited") return "已编辑";
+  if (status === "ready") return "已完成";
+  if (status === "processing") return "提炼中";
+  if (status === "validation_failed") return "提炼失败";
+  return "未提炼";
+}
+
 export function WorkshopPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const workshopId = id ? parseInt(id, 10) : null;
   const splitRef = useRef<HTMLDivElement | null>(null);
+  const qaResizeRef = useRef<HTMLDivElement | null>(null);
 
   const { workshop, participant, loading, error, fetchWorkshop } = useWorkshop(workshopId);
   const groupId = participant?.group_id ?? null;
@@ -85,6 +98,13 @@ export function WorkshopPage() {
   const [savingAIResult, setSavingAIResult] = useState(false);
   const [leaderTransferTarget, setLeaderTransferTarget] = useState<Participant | null>(null);
   const [transferringLeader, setTransferringLeader] = useState(false);
+  const [aiResultCollapsed, setAiResultCollapsed] = useState(() => {
+    return sessionStorage.getItem(AI_RESULT_COLLAPSED_KEY) === "1";
+  });
+  const [aiQaHeight, setAiQaHeight] = useState(() => {
+    const saved = Number(sessionStorage.getItem(AI_QA_HEIGHT_KEY));
+    return Number.isFinite(saved) ? clamp(saved, 240, 560) : 288;
+  });
 
   const handleExpire = useCallback(() => setExpired(true), []);
   const { remaining, minutes, seconds, isRunning, start, reset } = useCountdown(
@@ -92,7 +112,7 @@ export function WorkshopPage() {
     handleExpire,
   );
 
-  const { history, asking, ask, fetchHistory, clearHistory } = useAIAssistant(
+  const { history, asking, error: aiAskError, ask, fetchHistory, clearHistory } = useAIAssistant(
     workshopId,
     participant?.id ?? null,
     currentRound?.id,
@@ -113,6 +133,14 @@ export function WorkshopPage() {
   useEffect(() => {
     sessionStorage.setItem(PANEL_RATIO_KEY, String(panelRatio));
   }, [panelRatio]);
+
+  useEffect(() => {
+    sessionStorage.setItem(AI_RESULT_COLLAPSED_KEY, aiResultCollapsed ? "1" : "0");
+  }, [aiResultCollapsed]);
+
+  useEffect(() => {
+    sessionStorage.setItem(AI_QA_HEIGHT_KEY, String(aiQaHeight));
+  }, [aiQaHeight]);
 
   useEffect(() => {
     clearHistory();
@@ -245,10 +273,17 @@ export function WorkshopPage() {
   const handleAsk = useCallback(async () => {
     const q = aiQuestion.trim();
     if (!q || asking) return;
-    await ask(q);
-    setAiQuestion("");
-    fetchHistory();
+    const result = await ask(q);
+    if (result) {
+      setAiQuestion("");
+      fetchHistory();
+    }
   }, [aiQuestion, asking, ask, fetchHistory]);
+
+  const commitAiQaHeight = useCallback(() => {
+    if (!qaResizeRef.current) return;
+    setAiQaHeight(clamp(qaResizeRef.current.offsetHeight, 240, 560));
+  }, []);
 
   const handleStartEditAIResult = () => {
     setAIResultDraft(aiResult?.edited_content ?? aiResult?.original_content ?? "");
@@ -545,56 +580,67 @@ export function WorkshopPage() {
             <Card>
               <CardHeader className="pb-3">
                 <div className="flex items-center justify-between gap-2">
-                  <CardTitle className="text-base flex items-center gap-2">
-                    <Sparkles className="h-4 w-4 text-primary" />
-                    AI 提炼结果
-                  </CardTitle>
-                  {aiResult && (
-                    <Badge variant={aiResult.status === "edited" ? "default" : "outline"}>
-                      {aiResult.status === "edited" ? "已编辑" : aiResult.status}
-                    </Badge>
-                  )}
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    onClick={() => setAiResultCollapsed((value) => !value)}
+                  >
+                    <Sparkles className="h-4 w-4 shrink-0 text-primary" />
+                    <span className="text-base font-semibold">AI 提炼结果</span>
+                    {aiResultCollapsed ? (
+                      <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                    ) : (
+                      <ChevronUp className="h-4 w-4 text-muted-foreground" />
+                    )}
+                  </button>
+                  <Badge variant={aiResult?.status === "edited" ? "default" : "outline"}>
+                    {aiResultStatusLabel(aiResult?.status)}
+                  </Badge>
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                {aiResult ? (
-                  editingAIResult ? (
-                    <div className="space-y-3">
-                      <Textarea
-                        value={aiResultDraft}
-                        onChange={(event) => setAIResultDraft(event.target.value)}
-                        rows={12}
-                        className="text-sm font-mono"
-                      />
-                      <div className="flex gap-2">
-                        <Button size="sm" onClick={handleSaveAIResult} disabled={savingAIResult} className="gap-1">
-                          {savingAIResult ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
-                          保存
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => setEditingAIResult(false)} className="gap-1">
-                          <X className="h-4 w-4" />
-                          取消
-                        </Button>
+                {!aiResultCollapsed && (
+                  <>
+                    {aiResult ? (
+                      editingAIResult ? (
+                        <div className="space-y-3">
+                          <Textarea
+                            value={aiResultDraft}
+                            onChange={(event) => setAIResultDraft(event.target.value)}
+                            rows={12}
+                            className="text-sm font-mono"
+                          />
+                          <div className="flex gap-2">
+                            <Button size="sm" onClick={handleSaveAIResult} disabled={savingAIResult} className="gap-1">
+                              {savingAIResult ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
+                              保存
+                            </Button>
+                            <Button size="sm" variant="outline" onClick={() => setEditingAIResult(false)} className="gap-1">
+                              <X className="h-4 w-4" />
+                              取消
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="rounded-md bg-muted/30 p-3 text-sm leading-relaxed whitespace-pre-wrap break-words">
+                            {aiResult.edited_content ?? aiResult.original_content ?? "暂无内容"}
+                          </div>
+                          {canEditAIResult && (
+                            <Button size="sm" variant="outline" onClick={handleStartEditAIResult} className="gap-1">
+                              <Edit3 className="h-4 w-4" />
+                              编辑结果
+                            </Button>
+                          )}
+                        </div>
+                      )
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 py-4 text-muted-foreground">
+                        <Sparkles className="h-6 w-6" />
+                        <p className="text-xs text-center">AI 尚未生成结果</p>
                       </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="rounded-md bg-muted/30 p-3 text-sm leading-relaxed whitespace-pre-wrap">
-                        {aiResult.edited_content ?? aiResult.original_content ?? "暂无内容"}
-                      </div>
-                      {canEditAIResult && (
-                        <Button size="sm" variant="outline" onClick={handleStartEditAIResult} className="gap-1">
-                          <Edit3 className="h-4 w-4" />
-                          编辑结果
-                        </Button>
-                      )}
-                    </div>
-                  )
-                ) : (
-                  <div className="flex flex-col items-center gap-2 py-4 text-muted-foreground">
-                    <Sparkles className="h-6 w-6" />
-                    <p className="text-xs text-center">AI 尚未生成结果</p>
-                  </div>
+                    )}
+                  </>
                 )}
 
                 <Button
@@ -621,32 +667,45 @@ export function WorkshopPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                <ScrollArea className="h-72 rounded-md border bg-background">
-                  <div className="space-y-3 p-3">
-                    {history.length === 0 && (
-                      <p className="text-sm text-muted-foreground text-center py-8">暂无问答记录</p>
-                    )}
-                    {history.map((item) => (
-                      <div key={item.id} className="space-y-2">
-                        <div className="flex justify-end">
-                          <div className="bg-primary/10 rounded-md px-3 py-2 text-sm max-w-[85%]">
-                            {item.question}
-                          </div>
-                        </div>
-                        <div className="flex justify-start">
-                          <div className="bg-muted rounded-md px-3 py-2 text-sm max-w-[85%] whitespace-pre-wrap">
-                            {item.answer ?? (
-                              <span className="flex items-center gap-1 text-muted-foreground">
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                                回答生成中...
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
+                {aiAskError && (
+                  <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    {aiAskError}
                   </div>
-                </ScrollArea>
+                )}
+                <div
+                  ref={qaResizeRef}
+                  className="resize-y overflow-hidden rounded-md border bg-background"
+                  style={{ height: aiQaHeight, minHeight: 240, maxHeight: 560 }}
+                  onMouseUp={commitAiQaHeight}
+                  onTouchEnd={commitAiQaHeight}
+                >
+                  <ScrollArea className="h-full">
+                    <div className="space-y-3 p-3">
+                      {history.length === 0 && (
+                        <p className="text-sm text-muted-foreground text-center py-8">暂无问答记录</p>
+                      )}
+                      {history.map((item) => (
+                        <div key={item.id} className="space-y-2">
+                          <div className="flex justify-end">
+                            <div className="bg-primary/10 rounded-md px-3 py-2 text-sm max-w-[85%] whitespace-pre-wrap break-words">
+                              {item.question}
+                            </div>
+                          </div>
+                          <div className="flex justify-start">
+                            <div className="bg-muted rounded-md px-3 py-2 text-sm max-w-[85%] whitespace-pre-wrap break-words">
+                              {item.answer ?? (
+                                <span className="flex items-center gap-1 text-muted-foreground">
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                  回答生成中...
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </div>
 
                 <div className="flex gap-2">
                   <Input

@@ -133,8 +133,12 @@ class DeepSeekService:
 
     async def answer_member_question(self, question: str, group_context: str, kb_chunks: list[str]) -> str:
         kb_text = "\n\n---\n\n".join(kb_chunks) if kb_chunks else "（知识库暂无相关内容）"
-        system = "你是领导力发展领域的专家助手。请基于提供的知识库内容和本组讨论上下文，回答成员的问题。只回答与本组研讨相关的内容，不泄露其他组信息。用中文回答。"
-        user = f"## 知识库参考\n{kb_text}\n\n## 本组讨论上下文\n{group_context}\n\n## 成员问题\n{question}"
+        system = (
+            "你是领导力发展领域的专家助手。请严格基于提供的知识库检索结果、当前轮研讨问题、"
+            "本小组当前轮成员回答、本小组当前轮 AI 提炼结果和本小组当前轮 AI 问答历史回答成员问题。"
+            "不得引用或推测其他小组信息；如果上下文不足，请明确说明依据有限。用简洁中文回答。"
+        )
+        user = f"## 知识库参考\n{kb_text}\n\n## 当前小组当前轮上下文\n{group_context}\n\n## 成员问题\n{question}"
         return await self._call_api(system, user, model=self._chat_model)
 
     # ── Validation ──────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { aiApi } from "@/services/api";
 import type { AIQuestion } from "@/types";
 
@@ -6,6 +6,12 @@ export function useAIAssistant(workshopId: number | null, participantId: number 
   const [history, setHistory] = useState<AIQuestion[]>([]);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
   const ask = useCallback(async (question: string) => {
     if (!workshopId || !participantId) return null;
@@ -16,7 +22,7 @@ export function useAIAssistant(workshopId: number | null, participantId: number 
       setHistory((prev) => [a, ...prev]);
       return a;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "提问失败");
+      setError(err instanceof Error ? err.message : "AI 问答失败，请稍后重试");
       return null;
     } finally {
       setAsking(false);
@@ -35,5 +41,7 @@ export function useAIAssistant(workshopId: number | null, participantId: number 
     setError(null);
   }, []);
 
-  return { history, asking, error, ask, fetchHistory, clearHistory };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { history, asking, error, ask, fetchHistory, clearHistory, clearError };
 }
