@@ -1,4 +1,4 @@
-export type ParticipantGroup = 1 | 2 | 3 | 4;
+export type ParticipantGroup = number;
 export type RoundStatus = "locked" | "active" | "input" | "closing" | "completed";
 export type GroupResultStatus = "pending" | "processing" | "ready" | "validation_failed" | "edited";
 
@@ -140,10 +140,14 @@ export interface WorkshopMemberView {
   title: string;
   host_name: string;
   invite_code: string;
+  group_count: number;
   current_round: number;
+  flow_round_number: number;
+  is_review_mode: boolean;
   status: "active" | "completed";
   created_at: string;
   participant: ParticipantWithToken | null;
+  group_members: Participant[];
   rounds: Round[];
 }
 
@@ -154,7 +158,10 @@ export interface WorkshopHostView {
   invite_code: string;
   host_code: string;
   kb_admin_code: string;
+  group_count: number;
   current_round: number;
+  flow_round_number: number;
+  is_review_mode: boolean;
   status: "active" | "completed";
   created_at: string;
   groups: GroupInfo[];
@@ -166,6 +173,7 @@ export interface WorkshopCreateResponse {
   id: number;
   title: string;
   host_name: string;
+  group_count: number;
   invite_code: string;
   host_code: string;
   kb_admin_code: string;
@@ -184,6 +192,6 @@ export interface ExportResponse {
 }
 
 export interface WSMessage {
-  type: "new_answer" | "round_changed" | "result_ready" | "synthesis_ready" | "timer";
+  type: "new_answer" | "round_changed" | "result_ready" | "synthesis_ready" | "timer" | "group_leader_changed" | "workshop_completed" | "ai_result_status";
   data: Record<string, unknown>;
 }

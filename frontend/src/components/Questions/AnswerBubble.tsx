@@ -12,20 +12,20 @@ export function AnswerBubble({ answer }: AnswerBubbleProps) {
   });
 
   return (
-    <div className="flex gap-2 group">
-      <div className="h-7 w-7 shrink-0 rounded-full bg-muted flex items-center justify-center text-xs font-medium text-muted-foreground mt-0.5">
+    <div className="flex min-w-0 gap-2">
+      <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
         {displayName.charAt(0)}
       </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-sm font-medium text-foreground">
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex min-w-0 items-center gap-2">
+          <span className="min-w-0 truncate text-sm font-medium text-foreground">
             {displayName}
           </span>
-          <span className="text-xs text-muted-foreground ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
             {time}
           </span>
         </div>
-        <div className="bg-muted/50 rounded-lg rounded-tl-none px-3 py-2 text-sm text-foreground leading-relaxed">
+        <div className="max-w-full whitespace-pre-wrap break-words rounded-lg rounded-tl-none bg-muted/50 px-3 py-2 text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]">
           {answer.content}
         </div>
       </div>

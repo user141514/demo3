@@ -45,6 +45,7 @@ export function useAnswers(groupId: number | null, workshopId: number | null) {
     async (
       questionId: number,
       participantId: number,
+      sessionToken: string,
       content: string
     ) => {
       if (!groupId) return null;
@@ -54,6 +55,7 @@ export function useAnswers(groupId: number | null, workshopId: number | null) {
         const data = await groupApi.submitAnswer(groupId, {
           question_id: questionId,
           participant_id: participantId,
+          session_token: sessionToken,
           content,
         });
         setAnswers((prev) => [...prev, data]);

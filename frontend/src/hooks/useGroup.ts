@@ -44,10 +44,10 @@ export function useGroup(workshopId: number | null, groupId: number | null, roun
     setError(null);
   }, []);
 
-  const submitAnswer = useCallback(async (participant_id: number, question_id: number, content: string) => {
+  const submitAnswer = useCallback(async (participant_id: number, session_token: string, question_id: number, content: string) => {
     if (!groupId) return null;
     try {
-      const a = await groupApi.submitAnswer(groupId, { participant_id, question_id, content });
+      const a = await groupApi.submitAnswer(groupId, { participant_id, session_token, question_id, content });
       setAnswers((prev) => [...prev, a]);
       return a;
     } catch (err) {
@@ -56,11 +56,31 @@ export function useGroup(workshopId: number | null, groupId: number | null, roun
     }
   }, [groupId]);
 
-  const triggerAI = useCallback(async () => {
+  const transferLeader = useCallback(async (
+    participant_id: number,
+    session_token: string,
+    new_leader_participant_id: number,
+  ) => {
+    if (!workshopId || !groupId) return null;
+    try {
+      return await groupApi.transferLeader(
+        groupId,
+        workshopId,
+        participant_id,
+        session_token,
+        new_leader_participant_id,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "队长转移失败");
+      return null;
+    }
+  }, [workshopId, groupId]);
+
+  const triggerAI = useCallback(async (participant_id: number, session_token: string) => {
     if (!workshopId || !groupId) return null;
     setAiLoading(true);
     try {
-      const r = await groupApi.triggerAI(groupId, workshopId);
+      const r = await groupApi.triggerAI(groupId, workshopId, participant_id, session_token);
       setAiResult(r);
       return r;
     } catch (err) {
@@ -113,6 +133,6 @@ export function useGroup(workshopId: number | null, groupId: number | null, roun
     questions, answers, aiResult,
     loading, aiLoading, error,
     fetchQuestions, fetchAnswers, fetchAIResult, clearRoundState,
-    submitAnswer, triggerAI, editAIResult, addAnswer,
+    submitAnswer, triggerAI, editAIResult, transferLeader, addAnswer,
   };
 }

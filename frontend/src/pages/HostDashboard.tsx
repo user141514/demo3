@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useWorkshopHost } from "@/hooks/useWorkshopHost";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { groupApi, knowledgeApi } from "@/services/api";
+import { clearLastHostWorkshop, saveLastHostWorkshop } from "@/lib/hostSession";
 import {
   AlertTriangle,
   BookOpen,
@@ -44,6 +45,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { cn } from "@/lib/utils";
 import type { Answer, GroupRoundResult, RoundInfo, WSMessage } from "@/types";
 
 const ROUND_STATUS_LABEL: Record<string, string> = {
@@ -74,10 +76,17 @@ function finalResultContent(result: GroupRoundResult) {
 
 function resultStatusLabel(status: string) {
   if (status === "edited") return "已编辑";
-  if (status === "ready") return "已就绪";
-  if (status === "processing") return "处理中";
-  if (status === "validation_failed") return "验证失败";
-  return "待处理";
+  if (status === "ready") return "已完成";
+  if (status === "processing") return "提炼中";
+  if (status === "validation_failed") return "提炼失败";
+  return "未提炼";
+}
+
+function resultStatusVariant(status: string): "default" | "secondary" | "outline" | "destructive" {
+  if (status === "validation_failed") return "destructive";
+  if (status === "ready" || status === "edited") return "default";
+  if (status === "processing") return "secondary";
+  return "outline";
 }
 
 export function HostDashboard() {
@@ -92,6 +101,7 @@ export function HostDashboard() {
     error,
     fetchHost,
     unlockRound,
+    previousRound,
     updateRoundSettings,
     startTimer,
     submitHostInput,
@@ -113,6 +123,7 @@ export function HostDashboard() {
 
   const [roundTime, setRoundTime] = useState("");
   const [unlocking, setUnlocking] = useState(false);
+  const [revertingRound, setRevertingRound] = useState(false);
   const [startingTimer, setStartingTimer] = useState(false);
 
   const [hostInputContent, setHostInputContent] = useState("");
@@ -126,13 +137,35 @@ export function HostDashboard() {
   const [showExportDialog, setShowExportDialog] = useState(false);
 
   const [localError, setLocalError] = useState<string | null>(null);
+  const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [aiResultUnread, setAiResultUnread] = useState(false);
+  const [highlightedResultKey, setHighlightedResultKey] = useState<string | null>(null);
+  const aiStatusEventRef = useRef<Record<string, { time: number; signature: string }>>({});
 
   const currentRound = workshop?.rounds[Math.max(0, (workshop?.current_round ?? 1) - 1)] ?? null;
   const selectedResultRoundInfo =
     workshop?.rounds.find((round) => round.round_number === parseInt(selectedResultRound, 10)) ?? currentRound;
   const selectedSynthesisRoundInfo =
     workshop?.rounds.find((round) => round.round_number === parseInt(selectedSynthesisRound, 10)) ?? currentRound;
+  const groupNumbers = Array.from({ length: workshop?.group_count ?? 0 }, (_, index) => index + 1);
+
+  useEffect(() => {
+    if (!workshop || !hostCode) return;
+    saveLastHostWorkshop({
+      workshop_id: workshop.id,
+      host_code: hostCode,
+      title: workshop.title,
+    });
+  }, [workshop?.id, workshop?.title, hostCode]);
+
+  useEffect(() => {
+    if (!error || !workshopId || !hostCode) return;
+    if (/invalid host code|403/i.test(error)) {
+      clearLastHostWorkshop({ workshop_id: workshopId, host_code: hostCode });
+      setLocalError("主持人码无效，请重新输入");
+    }
+  }, [error, workshopId, hostCode]);
 
   useEffect(() => {
     if (!workshop || workshop.rounds.length === 0) return;
@@ -158,11 +191,55 @@ export function HostDashboard() {
     return () => window.clearTimeout(timer);
   }, [localError]);
 
+  useEffect(() => {
+    if (!localNotice) return;
+    const timer = window.setTimeout(() => setLocalNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [localNotice]);
+
+  useEffect(() => {
+    if (!highlightedResultKey) return;
+    const timer = window.setTimeout(() => setHighlightedResultKey(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [highlightedResultKey]);
+
+  useEffect(() => {
+    if (activeTab === "group-results") setAiResultUnread(false);
+  }, [activeTab]);
+
   const handleWSMessage = useCallback((msg: WSMessage) => {
-    if (["result_ready", "synthesis_ready", "round_changed", "new_answer", "timer"].includes(msg.type)) {
+    if (msg.type === "ai_result_status") {
+      const groupId = Number(msg.data.group_id);
+      const roundNumber = Number(msg.data.round_number);
+      const status = String(msg.data.status ?? "");
+      const reason = typeof msg.data.validation_error === "string" ? msg.data.validation_error : "";
+      const eventKey = `${roundNumber}:${groupId}`;
+      const signature = `${status}:${reason}`;
+      const now = Date.now();
+      const last = aiStatusEventRef.current[eventKey];
+      const isDuplicate = last && last.signature === signature && now - last.time < 12_000;
+      aiStatusEventRef.current[eventKey] = { time: now, signature };
+
+      fetchHost();
+      setAiResultUnread(activeTab !== "group-results");
+      setHighlightedResultKey(eventKey);
+
+      if (!isDuplicate && Number.isFinite(groupId) && Number.isFinite(roundNumber)) {
+        if (status === "processing") {
+          setLocalNotice(`第 ${groupId} 组 AI 提炼已开始`);
+        } else if (status === "validation_failed") {
+          setLocalError(`第 ${groupId} 组 AI 提炼失败：${reason || "未知原因"}`);
+        } else if (status === "ready" || status === "edited") {
+          setLocalNotice(`第 ${groupId} 组 AI 提炼已完成`);
+        }
+      }
+      return;
+    }
+
+    if (["result_ready", "synthesis_ready", "round_changed", "new_answer", "timer", "workshop_completed"].includes(msg.type)) {
       fetchHost();
     }
-  }, [fetchHost]);
+  }, [activeTab, fetchHost]);
 
   useWebSocket({
     workshopId,
@@ -212,6 +289,14 @@ export function HostDashboard() {
     const result = await unlockRound();
     if (!result) setLocalError("进入下一轮失败，请重试");
     setUnlocking(false);
+  };
+
+  const handlePreviousRound = async () => {
+    setRevertingRound(true);
+    clearLocalError();
+    const result = await previousRound();
+    if (!result) setLocalError("回到上一轮失败，请重试");
+    setRevertingRound(false);
   };
 
   const handleUpdateSettings = async () => {
@@ -384,7 +469,7 @@ export function HostDashboard() {
         <div className="flex flex-col items-center gap-4 text-center max-w-sm">
           <AlertTriangle className="h-12 w-12 text-destructive" />
           <h2 className="text-xl font-semibold">加载失败</h2>
-          <p className="text-muted-foreground">{error}</p>
+          <p className="text-muted-foreground">{localError ?? error}</p>
           <Button variant="outline" onClick={fetchHost}>
             <RefreshCw className="h-4 w-4 mr-2" />
             重试
@@ -442,13 +527,23 @@ export function HostDashboard() {
           <div className="max-w-7xl mx-auto">{localError}</div>
         </div>
       )}
+      {localNotice && (
+        <div className="bg-primary/10 text-primary text-sm px-6 py-2">
+          <div className="max-w-7xl mx-auto">{localNotice}</div>
+        </div>
+      )}
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col">
         <div className="border-b px-6 flex justify-center">
           <TabsList className="h-12 flex-wrap justify-center">
             <TabsTrigger value="overview">总览</TabsTrigger>
             <TabsTrigger value="round-control">轮次管理</TabsTrigger>
-            <TabsTrigger value="group-results">各组成果</TabsTrigger>
+            <TabsTrigger value="group-results" className="relative">
+              各组成果
+              {aiResultUnread && (
+                <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-destructive" />
+              )}
+            </TabsTrigger>
             <TabsTrigger value="synthesis">综合汇总</TabsTrigger>
             <TabsTrigger value="host-input">主持人输入</TabsTrigger>
             <TabsTrigger value="knowledge">知识库</TabsTrigger>
@@ -515,6 +610,22 @@ export function HostDashboard() {
                           <p className="text-sm text-muted-foreground">
                             组长: {group.leader_name ?? "暂无组长"}
                           </p>
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {group.members.length > 0 ? (
+                              group.members.map((member) => (
+                                <Badge
+                                  key={member.id}
+                                  variant={member.is_group_leader ? "default" : "outline"}
+                                  className="max-w-full gap-1"
+                                >
+                                  <span className="truncate">{member.name}</span>
+                                  {member.is_group_leader && <span className="text-[10px]">队长</span>}
+                                </Badge>
+                              ))
+                            ) : (
+                              <span className="text-sm text-muted-foreground">暂无成员</span>
+                            )}
+                          </div>
                         </div>
                       </CardContent>
                     </Card>
@@ -565,10 +676,26 @@ export function HostDashboard() {
                       </div>
                       {currentRound.objective && <p className="text-sm text-muted-foreground">{currentRound.objective}</p>}
                       {workshop.status === "active" && (
-                        <Button onClick={handleUnlockRound} disabled={unlocking} className="gap-2">
-                          {unlocking ? <LoadingSpinner size="sm" /> : <Unlock className="h-4 w-4" />}
-                          {currentRound.round_number < 4 ? "进入下一轮" : "结束研讨"}
-                        </Button>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            variant="outline"
+                            onClick={handlePreviousRound}
+                            disabled={revertingRound || workshop.is_review_mode || (workshop.flow_round_number ?? workshop.current_round) <= 1}
+                            className="gap-2"
+                          >
+                            {revertingRound ? <LoadingSpinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
+                            回到上一轮
+                          </Button>
+                          <Button onClick={handleUnlockRound} disabled={unlocking} className="gap-2">
+                            {unlocking ? <LoadingSpinner size="sm" /> : <Unlock className="h-4 w-4" />}
+                            {(workshop.flow_round_number ?? currentRound.round_number) < 4 ? "进入下一轮" : "结束研讨"}
+                          </Button>
+                        </div>
+                      )}
+                      {workshop.is_review_mode && (
+                        <p className="text-sm text-primary">
+                          当前为历史轮次查看模式。点击主流程按钮将回到原主流程并继续推进。
+                        </p>
                       )}
                       {(currentRound.status === "active" || currentRound.status === "input") && (
                         <div className="flex flex-wrap items-center gap-3">
@@ -601,9 +728,10 @@ export function HostDashboard() {
                           value={roundTime}
                           onChange={(event) => setRoundTime(event.target.value)}
                           placeholder="本轮时长"
+                          disabled={workshop.is_review_mode}
                         />
                       </div>
-                      <Button onClick={handleUpdateSettings} variant="outline" className="gap-2">
+                      <Button onClick={handleUpdateSettings} variant="outline" className="gap-2" disabled={workshop.is_review_mode}>
                         <Save className="h-4 w-4" />
                         保存设置
                       </Button>
@@ -642,6 +770,40 @@ export function HostDashboard() {
                   </Select>
                 </div>
               </div>
+
+              {selectedResultRoundInfo && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+                  {groupNumbers.map((groupId) => {
+                    const result = selectedResultRoundInfo.group_results.find((item) => item.group_id === groupId);
+                    const status = result?.status ?? "pending";
+                    const highlightKey = `${selectedResultRoundInfo.round_number}:${groupId}`;
+                    return (
+                      <button
+                        key={groupId}
+                        type="button"
+                        onClick={() => setSelectedGroup(String(groupId))}
+                        className={cn(
+                          "rounded-md border bg-card p-3 text-left transition-colors",
+                          selectedGroupId === groupId && "border-primary bg-primary/5",
+                          highlightedResultKey === highlightKey && "border-primary bg-primary/10 shadow-sm",
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium">第 {groupId} 组</span>
+                          <Badge variant={resultStatusVariant(status)}>{resultStatusLabel(status)}</Badge>
+                        </div>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          最近更新：
+                          {result?.updated_at ? new Date(result.updated_at).toLocaleString("zh-CN") : "暂无"}
+                        </p>
+                        {result?.validation_error && (
+                          <p className="mt-1 line-clamp-2 text-xs text-destructive">{result.validation_error}</p>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
               {!selectedResultRoundInfo ? (
                 <Card>
@@ -691,9 +853,12 @@ export function HostDashboard() {
                           <div className="flex items-center justify-between gap-3">
                             <CardTitle className="text-base">
                               第 {selectedGroupId} 组 AI 提炼结果
-                              <Badge className="ml-2" variant={result.status === "edited" ? "default" : result.status === "ready" ? "secondary" : "outline"}>
+                              <Badge className="ml-2" variant={resultStatusVariant(result.status)}>
                                 {resultStatusLabel(result.status)}
                               </Badge>
+                              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                                {new Date(result.updated_at).toLocaleString("zh-CN")}
+                              </span>
                             </CardTitle>
                             <Button size="sm" variant="outline" onClick={() => handleStartEditResult(result)} className="gap-1">
                               <Edit3 className="h-4 w-4" />
@@ -791,7 +956,7 @@ export function HostDashboard() {
                       <CardTitle className="text-base">各组最终提交的 AI 提炼结果</CardTitle>
                     </CardHeader>
                     <CardContent className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                      {[1, 2, 3, 4].map((groupId) => {
+                      {groupNumbers.map((groupId) => {
                         const result = selectedSynthesisRoundInfo.group_results.find((item) => item.group_id === groupId);
                         const content = result ? finalResultContent(result) : "";
                         return (

@@ -8,17 +8,36 @@ export function useWorkshop(workshopId: number | null) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchWorkshop = useCallback(async () => {
+  const fetchWorkshop = useCallback(async (options?: { silent?: boolean }) => {
     if (!workshopId) return;
-    setLoading(true);
+    const silent = options?.silent ?? false;
+    if (!silent) setLoading(true);
     setError(null);
     try {
-      const data = await workshopApi.get(workshopId);
+      let savedParticipant: ParticipantWithToken | null = null;
+      const saved = sessionStorage.getItem("participant");
+      if (saved) {
+        try {
+          savedParticipant = JSON.parse(saved);
+          if (savedParticipant?.workshop_id === workshopId) {
+            setParticipant(savedParticipant);
+          }
+        } catch { /* ignore */ }
+      }
+      const data = await workshopApi.get(
+        workshopId,
+        savedParticipant?.workshop_id === workshopId ? savedParticipant.id : undefined,
+        savedParticipant?.workshop_id === workshopId ? savedParticipant.session_token : undefined,
+      );
       setWorkshop(data);
+      if (data.participant) {
+        setParticipant(data.participant);
+        sessionStorage.setItem("participant", JSON.stringify(data.participant));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "获取工作坊失败");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [workshopId]);
 

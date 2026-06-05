@@ -1,14 +1,32 @@
 import type {
   WorkshopCreateResponse, WorkshopMemberView, WorkshopHostView,
-  ParticipantWithToken, Question, Answer, GroupRoundResult,
+  Participant, ParticipantWithToken, Question, Answer, GroupRoundResult,
   SynthesisResult, HostInput, KnowledgeDocument, AIQuestion,
   ValidateResponse, ExportResponse,
 } from "@/types";
 
-const BASE_URL = "http://localhost:8000/api";
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
+
+export function getWebSocketUrl(workshopId: number, channel: string) {
+  const explicitWsBase = import.meta.env.VITE_WS_BASE_URL;
+  const encodedChannel = encodeURIComponent(channel);
+  if (explicitWsBase) {
+    return `${String(explicitWsBase).replace(/\/$/, "")}/ws/${workshopId}?channel=${encodedChannel}`;
+  }
+
+  try {
+    const apiUrl = new URL(API_BASE_URL, window.location.origin);
+    const protocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+    const basePath = apiUrl.pathname.replace(/\/api\/?$/, "").replace(/\/$/, "");
+    return `${protocol}//${apiUrl.host}${basePath}/ws/${workshopId}?channel=${encodedChannel}`;
+  } catch {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/ws/${workshopId}?channel=${encodedChannel}`;
+  }
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${url}`, {
+  const res = await fetch(`${API_BASE_URL}${url}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -35,14 +53,18 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 // ── Workshop ──────────────────────────────────────────────────────────
 
 export const workshopApi = {
-  create: (title: string, host_name: string) =>
+  create: (title: string, host_name: string, group_count = 4) =>
     request<WorkshopCreateResponse>("/workshops", {
       method: "POST",
-      body: JSON.stringify({ title, host_name }),
+      body: JSON.stringify({ title, host_name, group_count }),
     }),
 
-  get: (id: number) =>
-    request<WorkshopMemberView>(`/workshops/${id}`),
+  get: (id: number, participant_id?: number, session_token?: string) => {
+    const params = participant_id && session_token
+      ? `?participant_id=${participant_id}&session_token=${encodeURIComponent(session_token)}`
+      : "";
+    return request<WorkshopMemberView>(`/workshops/${id}${params}`);
+  },
 
   getHost: (id: number, code: string) =>
     request<WorkshopHostView>(`/workshops/${id}/host?code=${encodeURIComponent(code)}`),
@@ -67,6 +89,11 @@ export const workshopApi = {
 
   unlockRound: (id: number, code: string) =>
     request<WorkshopHostView>(`/workshops/${id}/unlock-round?code=${encodeURIComponent(code)}`, {
+      method: "POST",
+    }),
+
+  previousRound: (id: number, code: string) =>
+    request<WorkshopHostView>(`/workshops/${id}/previous-round?code=${encodeURIComponent(code)}`, {
       method: "POST",
     }),
 
@@ -109,7 +136,7 @@ export const groupApi = {
   getQuestions: (groupId: number, workshopId: number) =>
     request<Question[]>(`/groups/${groupId}/questions?workshop_id=${workshopId}`),
 
-  submitAnswer: (groupId: number, data: { participant_id: number; question_id: number; content: string }) =>
+  submitAnswer: (groupId: number, data: { participant_id: number; session_token: string; question_id: number; content: string }) =>
     request<Answer>(`/groups/${groupId}/answers`, {
       method: "POST",
       body: JSON.stringify(data),
@@ -118,9 +145,10 @@ export const groupApi = {
   getAnswers: (groupId: number, workshopId: number) =>
     request<Answer[]>(`/groups/${groupId}/answers?workshop_id=${workshopId}`),
 
-  triggerAI: (groupId: number, workshopId: number) =>
+  triggerAI: (groupId: number, workshopId: number, participant_id: number, session_token: string) =>
     request<GroupRoundResult>(`/groups/${groupId}/ai-generate?workshop_id=${workshopId}`, {
       method: "POST",
+      body: JSON.stringify({ participant_id, session_token }),
     }),
 
   getAIResult: (groupId: number, workshopId: number) =>
@@ -136,6 +164,18 @@ export const groupApi = {
     request<GroupRoundResult>(`/groups/${groupId}/ai-result?workshop_id=${workshopId}`, {
       method: "PUT",
       body: JSON.stringify({ participant_id, session_token, edited_content }),
+    }),
+
+  transferLeader: (
+    groupId: number,
+    workshop_id: number,
+    participant_id: number,
+    session_token: string,
+    new_leader_participant_id: number,
+  ) =>
+    request<Participant[]>(`/groups/${groupId}/leader`, {
+      method: "PUT",
+      body: JSON.stringify({ workshop_id, participant_id, session_token, new_leader_participant_id }),
     }),
 
   synthesize: (roundId: number) =>
