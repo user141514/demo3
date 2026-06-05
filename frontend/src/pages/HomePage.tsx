@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
 import { workshopApi } from "@/services/api";
+import { copyText } from "@/lib/copyText";
 import type { WorkshopCreateResponse } from "@/types";
 
 export function HomePage() {
@@ -60,10 +61,14 @@ export function HomePage() {
     }
   };
 
-  const copyCode = (code: string, label: string) => {
-    navigator.clipboard.writeText(code);
-    setCopied(label);
-    setTimeout(() => setCopied(null), 2000);
+  const copyCode = async (code: string, label: string) => {
+    try {
+      await copyText(code);
+      setCopied(label);
+      setTimeout(() => setCopied(null), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制失败，请手动复制");
+    }
   };
 
   const enterHost = () => {

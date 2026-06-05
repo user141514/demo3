@@ -44,6 +44,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { copyText } from "@/lib/copyText";
 import type { Answer, GroupRoundResult, RoundInfo, WSMessage } from "@/types";
 
 const ROUND_STATUS_LABEL: Record<string, string> = {
@@ -185,11 +186,11 @@ export function HostDashboard() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(content);
+      await copyText(content);
       setCopiedKey(key);
       window.setTimeout(() => setCopiedKey(null), 1500);
-    } catch {
-      setLocalError("复制失败，请重试");
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "复制失败，请重试");
     }
   };
 
