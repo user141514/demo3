@@ -45,6 +45,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { MarkdownContent } from "@/components/Shared/MarkdownContent";
 import { cn } from "@/lib/utils";
 import type { Answer, GroupRoundResult, RoundInfo, WSMessage } from "@/types";
 
@@ -63,6 +64,9 @@ const ROUND_STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" |
   closing: "secondary",
   completed: "outline",
 };
+
+const AI_RESULT_BOX_CLASS = "min-h-[18rem] max-h-[32rem] overflow-y-auto";
+const AI_RESULT_TEXTAREA_CLASS = "min-h-[18rem] max-h-[32rem] overflow-y-auto resize-y font-mono text-sm";
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -107,6 +111,7 @@ export function HostDashboard() {
     submitHostInput,
     editGroupResult,
     editSynthesis,
+    setGroupLeader,
     exportMarkdown,
   } = useWorkshopHost(workshopId, hostCode);
 
@@ -115,11 +120,15 @@ export function HostDashboard() {
   const [selectedResultRound, setSelectedResultRound] = useState("1");
   const [editingResultId, setEditingResultId] = useState<number | null>(null);
   const [editingResultContent, setEditingResultContent] = useState("");
+  const [savingResultEditId, setSavingResultEditId] = useState<number | null>(null);
 
   const [selectedSynthesisRound, setSelectedSynthesisRound] = useState("1");
   const [editingSynthesis, setEditingSynthesis] = useState(false);
   const [synthesisEditContent, setSynthesisEditContent] = useState("");
   const [synthesizing, setSynthesizing] = useState(false);
+  const [editingSynthesisGroupId, setEditingSynthesisGroupId] = useState<number | null>(null);
+  const [synthesisGroupDrafts, setSynthesisGroupDrafts] = useState<Record<number, string>>({});
+  const [savingSynthesisGroupId, setSavingSynthesisGroupId] = useState<number | null>(null);
 
   const [roundTime, setRoundTime] = useState("");
   const [unlocking, setUnlocking] = useState(false);
@@ -141,7 +150,10 @@ export function HostDashboard() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [aiResultUnread, setAiResultUnread] = useState(false);
   const [highlightedResultKey, setHighlightedResultKey] = useState<string | null>(null);
+  const [leaderTarget, setLeaderTarget] = useState<{ groupId: number; participantId: number; name: string } | null>(null);
+  const [settingLeader, setSettingLeader] = useState(false);
   const aiStatusEventRef = useRef<Record<string, { time: number; signature: string }>>({});
+  const actionLocksRef = useRef<Set<string>>(new Set());
 
   const currentRound = workshop?.rounds[Math.max(0, (workshop?.current_round ?? 1) - 1)] ?? null;
   const selectedResultRoundInfo =
@@ -149,6 +161,7 @@ export function HostDashboard() {
   const selectedSynthesisRoundInfo =
     workshop?.rounds.find((round) => round.round_number === parseInt(selectedSynthesisRound, 10)) ?? currentRound;
   const groupNumbers = Array.from({ length: workshop?.group_count ?? 0 }, (_, index) => index + 1);
+  const isCompletedView = workshop?.status === "completed";
 
   useEffect(() => {
     if (!workshop || !hostCode) return;
@@ -255,6 +268,16 @@ export function HostDashboard() {
     return err.message.replace(/^API error \d+:\s*/, "") || fallback;
   };
 
+  const runLocked = useCallback(async <T,>(key: string, task: () => Promise<T>): Promise<T | null> => {
+    if (actionLocksRef.current.has(key)) return null;
+    actionLocksRef.current.add(key);
+    try {
+      return await task();
+    } finally {
+      actionLocksRef.current.delete(key);
+    }
+  }, []);
+
   const handleCopyText = async (text: string | null | undefined, key: string) => {
     const content = text?.trim();
     if (!content) {
@@ -267,6 +290,20 @@ export function HostDashboard() {
       window.setTimeout(() => setCopiedKey(null), 1500);
     } catch {
       setLocalError("复制失败，请重试");
+    }
+  };
+
+  const handleConfirmSetLeader = async () => {
+    if (!leaderTarget) return;
+    setSettingLeader(true);
+    try {
+      const result = await runLocked("set-group-leader", () => setGroupLeader(leaderTarget.groupId, leaderTarget.participantId));
+      if (result) {
+        setLocalNotice(`已将 ${leaderTarget.name} 设置为第 ${leaderTarget.groupId} 组组长`);
+        setLeaderTarget(null);
+      }
+    } finally {
+      setSettingLeader(false);
     }
   };
 
@@ -286,59 +323,80 @@ export function HostDashboard() {
   const handleUnlockRound = async () => {
     setUnlocking(true);
     clearLocalError();
-    const result = await unlockRound();
-    if (!result) setLocalError("进入下一轮失败，请重试");
-    setUnlocking(false);
+    try {
+      const result = await runLocked("unlock-round", unlockRound);
+      if (!result) setLocalError("进入下一轮失败，请重试");
+    } finally {
+      setUnlocking(false);
+    }
   };
 
   const handlePreviousRound = async () => {
     setRevertingRound(true);
     clearLocalError();
-    const result = await previousRound();
-    if (!result) setLocalError("回到上一轮失败，请重试");
-    setRevertingRound(false);
+    try {
+      const result = await runLocked("previous-round", previousRound);
+      if (!result) setLocalError("回到上一轮失败，请重试");
+    } finally {
+      setRevertingRound(false);
+    }
   };
 
   const handleUpdateSettings = async () => {
     clearLocalError();
     const minutes = roundTime ? parseInt(roundTime, 10) : undefined;
-    const result = await updateRoundSettings(minutes, minutes);
+    const result = await runLocked("round-settings", () => updateRoundSettings(minutes, minutes));
     if (!result) setLocalError("更新设置失败，请重试");
   };
 
   const handleStartTimer = async () => {
     setStartingTimer(true);
     clearLocalError();
-    const result = await startTimer();
-    if (!result) setLocalError("开始计时失败，请重试");
-    setStartingTimer(false);
+    try {
+      const result = await runLocked("start-timer", startTimer);
+      if (!result) setLocalError("开始计时失败，请重试");
+    } finally {
+      setStartingTimer(false);
+    }
   };
 
   const handleStartEditResult = (result: GroupRoundResult) => {
+    if (isCompletedView) return;
     setEditingResultId(result.id);
     setEditingResultContent(result.edited_content ?? result.original_content ?? "");
   };
 
   const handleSaveEditResult = async () => {
+    if (isCompletedView) return;
     if (editingResultId === null) return;
     clearLocalError();
-    const result = await editGroupResult(editingResultId, editingResultContent);
-    if (result) {
-      setEditingResultId(null);
-      setEditingResultContent("");
-      fetchHost();
-    } else {
-      setLocalError("保存编辑结果失败");
+    setSavingResultEditId(editingResultId);
+    try {
+      const result = await runLocked(`edit-group-result:${editingResultId}`, () => editGroupResult(editingResultId, editingResultContent));
+      if (result) {
+        setEditingResultId(null);
+        setEditingResultContent("");
+        fetchHost();
+      } else {
+        setLocalError("保存编辑结果失败");
+      }
+    } finally {
+      setSavingResultEditId(null);
     }
   };
 
   const handleTriggerSynthesis = async () => {
+    if (isCompletedView) return;
     if (!selectedSynthesisRoundInfo) return;
     setSynthesizing(true);
     clearLocalError();
     try {
-      await groupApi.synthesize(selectedSynthesisRoundInfo.id);
-      await fetchHost();
+      const result = await runLocked(`synthesize:${selectedSynthesisRoundInfo.id}`, async () => {
+        await groupApi.synthesize(selectedSynthesisRoundInfo.id);
+        await fetchHost();
+        return true;
+      });
+      if (!result) return;
     } catch (err) {
       setLocalError(getErrorMessage(err, "综合提炼失败，请重试"));
     } finally {
@@ -347,6 +405,7 @@ export function HostDashboard() {
   };
 
   const handleStartEditSynthesis = () => {
+    if (isCompletedView) return;
     if (!selectedSynthesisRoundInfo?.synthesis) return;
     setSynthesisEditContent(
       selectedSynthesisRoundInfo.synthesis.edited_content ??
@@ -357,9 +416,10 @@ export function HostDashboard() {
   };
 
   const handleSaveEditSynthesis = async () => {
+    if (isCompletedView) return;
     if (!selectedSynthesisRoundInfo) return;
     clearLocalError();
-    const result = await editSynthesis(selectedSynthesisRoundInfo.id, synthesisEditContent);
+    const result = await runLocked(`edit-synthesis:${selectedSynthesisRoundInfo.id}`, () => editSynthesis(selectedSynthesisRoundInfo.id, synthesisEditContent));
     if (result) {
       setEditingSynthesis(false);
       fetchHost();
@@ -369,12 +429,16 @@ export function HostDashboard() {
   };
 
   const handleSaveHostInput = async () => {
+    if (isCompletedView) return;
     if (!currentRound) return;
     setSavingHostInput(true);
     clearLocalError();
-    const result = await submitHostInput(currentRound.id, hostInputContent);
-    if (!result) setLocalError("保存主持人输入失败");
-    setSavingHostInput(false);
+    try {
+      const result = await runLocked(`host-input:${currentRound.id}`, () => submitHostInput(currentRound.id, hostInputContent));
+      if (!result) setLocalError("保存主持人输入失败");
+    } finally {
+      setSavingHostInput(false);
+    }
   };
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -429,14 +493,52 @@ export function HostDashboard() {
   const handleExport = async () => {
     setExporting(true);
     clearLocalError();
-    const data = await exportMarkdown();
-    if (data) {
-      setExportData(data);
-      setShowExportDialog(true);
-    } else {
-      setLocalError("导出失败");
+    try {
+      const data = await runLocked("export", exportMarkdown);
+      if (data) {
+        setExportData(data);
+        setShowExportDialog(true);
+      } else {
+        setLocalError("导出失败");
+      }
+    } finally {
+      setExporting(false);
     }
-    setExporting(false);
+  };
+
+  const handleStartEditSynthesisGroup = (result: GroupRoundResult) => {
+    if (isCompletedView) return;
+    setEditingSynthesisGroupId(result.id);
+    setSynthesisGroupDrafts((prev) => ({
+      ...prev,
+      [result.id]: result.edited_content ?? result.original_content ?? "",
+    }));
+  };
+
+  const handleCancelEditSynthesisGroup = () => {
+    setEditingSynthesisGroupId(null);
+  };
+
+  const handleSaveSynthesisGroupResult = async (result: GroupRoundResult) => {
+    if (isCompletedView) return;
+    const draft = (synthesisGroupDrafts[result.id] ?? "").trim();
+    if (!draft) {
+      setLocalError("编辑内容不能为空");
+      return;
+    }
+    clearLocalError();
+    setSavingSynthesisGroupId(result.id);
+    try {
+      const updated = await runLocked(`edit-synthesis-group:${result.id}`, () => editGroupResult(result.id, draft));
+      if (updated) {
+        setEditingSynthesisGroupId(null);
+        await fetchHost();
+      } else {
+        setLocalError("保存各组 AI 提炼结果编辑失败");
+      }
+    } finally {
+      setSavingSynthesisGroupId(null);
+    }
   };
 
   const handleDownloadExport = () => {
@@ -532,6 +634,11 @@ export function HostDashboard() {
           <div className="max-w-7xl mx-auto">{localNotice}</div>
         </div>
       )}
+      {isCompletedView && (
+        <div className="bg-muted px-6 py-2 text-sm text-muted-foreground">
+          <div className="max-w-7xl mx-auto">本次研讨已结束，当前仅支持查看会议资料。</div>
+        </div>
+      )}
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col">
         <div className="border-b px-6 flex justify-center">
@@ -613,14 +720,30 @@ export function HostDashboard() {
                           <div className="mt-2 flex flex-wrap gap-1.5">
                             {group.members.length > 0 ? (
                               group.members.map((member) => (
-                                <Badge
+                                <button
                                   key={member.id}
-                                  variant={member.is_group_leader ? "default" : "outline"}
-                                  className="max-w-full gap-1"
+                                  type="button"
+                                  disabled={isCompletedView || member.is_group_leader}
+                                  onClick={() => setLeaderTarget({ groupId: group.group_id, participantId: member.id, name: member.name })}
+                                  className={cn(
+                                    "inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors",
+                                    member.is_group_leader
+                                      ? "border-primary bg-primary text-primary-foreground"
+                                      : "border-border bg-background text-foreground",
+                                    !isCompletedView && !member.is_group_leader && "cursor-pointer hover:border-primary hover:bg-primary/5",
+                                    (isCompletedView || member.is_group_leader) && "cursor-default",
+                                  )}
+                                  title={
+                                    isCompletedView
+                                      ? "已结束会议仅支持查看"
+                                      : member.is_group_leader
+                                        ? "当前组长"
+                                        : `设置 ${member.name} 为第 ${group.group_id} 组组长`
+                                  }
                                 >
                                   <span className="truncate">{member.name}</span>
                                   {member.is_group_leader && <span className="text-[10px]">队长</span>}
-                                </Badge>
+                                </button>
                               ))
                             ) : (
                               <span className="text-sm text-muted-foreground">暂无成员</span>
@@ -675,18 +798,18 @@ export function HostDashboard() {
                         </Badge>
                       </div>
                       {currentRound.objective && <p className="text-sm text-muted-foreground">{currentRound.objective}</p>}
-                      {workshop.status === "active" && (
+                      {workshop.status === "active" && !isCompletedView && (
                         <div className="flex flex-wrap gap-2">
                           <Button
                             variant="outline"
                             onClick={handlePreviousRound}
-                            disabled={revertingRound || workshop.is_review_mode || (workshop.flow_round_number ?? workshop.current_round) <= 1}
+                            disabled={isCompletedView || revertingRound || workshop.is_review_mode || (workshop.flow_round_number ?? workshop.current_round) <= 1}
                             className="gap-2"
                           >
                             {revertingRound ? <LoadingSpinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
                             回到上一轮
                           </Button>
-                          <Button onClick={handleUnlockRound} disabled={unlocking} className="gap-2">
+                          <Button onClick={handleUnlockRound} disabled={isCompletedView || unlocking} className="gap-2">
                             {unlocking ? <LoadingSpinner size="sm" /> : <Unlock className="h-4 w-4" />}
                             {(workshop.flow_round_number ?? currentRound.round_number) < 4 ? "进入下一轮" : "结束研讨"}
                           </Button>
@@ -699,7 +822,7 @@ export function HostDashboard() {
                       )}
                       {(currentRound.status === "active" || currentRound.status === "input") && (
                         <div className="flex flex-wrap items-center gap-3">
-                          <Button onClick={handleStartTimer} disabled={startingTimer} className="gap-2">
+                          <Button onClick={handleStartTimer} disabled={isCompletedView || startingTimer} className="gap-2">
                             {startingTimer ? <LoadingSpinner size="sm" /> : <Play className="h-4 w-4" />}
                             {currentRound.timer_started_at ? "重新开始计时" : "开始计时"}
                           </Button>
@@ -728,10 +851,10 @@ export function HostDashboard() {
                           value={roundTime}
                           onChange={(event) => setRoundTime(event.target.value)}
                           placeholder="本轮时长"
-                          disabled={workshop.is_review_mode}
+                          disabled={isCompletedView || workshop.is_review_mode}
                         />
                       </div>
-                      <Button onClick={handleUpdateSettings} variant="outline" className="gap-2" disabled={workshop.is_review_mode}>
+                      <Button onClick={handleUpdateSettings} variant="outline" className="gap-2" disabled={isCompletedView || workshop.is_review_mode || actionLocksRef.current.has("round-settings")}>
                         <Save className="h-4 w-4" />
                         保存设置
                       </Button>
@@ -860,7 +983,7 @@ export function HostDashboard() {
                                 {new Date(result.updated_at).toLocaleString("zh-CN")}
                               </span>
                             </CardTitle>
-                            <Button size="sm" variant="outline" onClick={() => handleStartEditResult(result)} className="gap-1">
+                            <Button size="sm" variant="outline" onClick={() => handleStartEditResult(result)} disabled={isCompletedView} className="gap-1">
                               <Edit3 className="h-4 w-4" />
                               编辑最终结果
                             </Button>
@@ -872,15 +995,15 @@ export function HostDashboard() {
                               <Textarea
                                 value={editingResultContent}
                                 onChange={(event) => setEditingResultContent(event.target.value)}
-                                rows={8}
-                                className="font-mono text-sm"
+                                className={AI_RESULT_TEXTAREA_CLASS}
+                                disabled={isCompletedView}
                               />
                               <div className="flex gap-2">
-                                <Button size="sm" onClick={handleSaveEditResult} className="gap-1">
-                                  <Save className="h-4 w-4" />
-                                  保存
+                                <Button size="sm" onClick={handleSaveEditResult} disabled={isCompletedView || savingResultEditId === result.id} className="gap-1">
+                                  {savingResultEditId === result.id ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
+                                  {savingResultEditId === result.id ? "保存中..." : "保存"}
                                 </Button>
-                                <Button size="sm" variant="outline" onClick={() => setEditingResultId(null)} className="gap-1">
+                                <Button size="sm" variant="outline" onClick={() => setEditingResultId(null)} disabled={savingResultEditId === result.id} className="gap-1">
                                   <X className="h-4 w-4" />
                                   取消
                                 </Button>
@@ -893,18 +1016,18 @@ export function HostDashboard() {
                                   <h4 className="text-sm font-medium">原始 AI 提炼结果</h4>
                                   {copyButton(result.original_content, `group-${result.id}-original`)}
                                 </div>
-                                <div className="bg-muted/30 rounded-md p-4 text-sm whitespace-pre-wrap font-mono">
-                                  {result.original_content || "(空)"}
-                                </div>
+                                <MarkdownContent content={result.original_content} className={AI_RESULT_BOX_CLASS} />
                               </div>
                               <div className="space-y-2">
                                 <div className="flex items-center justify-between">
                                   <h4 className="text-sm font-medium">编辑后的 AI 提炼结果</h4>
                                   {copyButton(result.edited_content ?? result.original_content, `group-${result.id}-edited`)}
                                 </div>
-                                <div className="bg-muted/30 rounded-md p-4 text-sm whitespace-pre-wrap font-mono">
-                                  {result.edited_content || "(未编辑)"}
-                                </div>
+                                <MarkdownContent
+                                  content={result.edited_content}
+                                  emptyText="(未编辑)"
+                                  className={AI_RESULT_BOX_CLASS}
+                                />
                               </div>
                               {result.validation_error && (
                                 <p className="text-sm text-destructive">失败原因: {result.validation_error}</p>
@@ -939,7 +1062,7 @@ export function HostDashboard() {
                     </SelectContent>
                   </Select>
                 </div>
-                <Button onClick={handleTriggerSynthesis} disabled={synthesizing || !selectedSynthesisRoundInfo} className="gap-2">
+                <Button onClick={handleTriggerSynthesis} disabled={isCompletedView || synthesizing || !selectedSynthesisRoundInfo} className="gap-2">
                   {synthesizing ? <LoadingSpinner size="sm" /> : <Sparkles className="h-4 w-4" />}
                   综合提炼
                 </Button>
@@ -959,15 +1082,55 @@ export function HostDashboard() {
                       {groupNumbers.map((groupId) => {
                         const result = selectedSynthesisRoundInfo.group_results.find((item) => item.group_id === groupId);
                         const content = result ? finalResultContent(result) : "";
+                        const isEditingGroupResult = Boolean(result && editingSynthesisGroupId === result.id);
+                        const isSavingGroupResult = Boolean(result && savingSynthesisGroupId === result.id);
                         return (
                           <div key={groupId} className="rounded-md border p-3 space-y-2">
                             <div className="flex items-center justify-between gap-2">
-                              <h4 className="text-sm font-medium">第 {groupId} 组</h4>
-                              {result && copyButton(content, `synthesis-round-${selectedSynthesisRoundInfo.id}-group-${groupId}`)}
+                              <div className="flex items-center gap-2">
+                                <h4 className="text-sm font-medium">第 {groupId} 组</h4>
+                                {result && (
+                                  <Badge variant={result.status === "edited" ? "default" : "outline"}>
+                                    {result.status === "edited" ? "已编辑" : "原始结果"}
+                                  </Badge>
+                                )}
+                              </div>
+                              {result && !isEditingGroupResult && (
+                                <div className="flex gap-2">
+                                  {copyButton(content, `synthesis-round-${selectedSynthesisRoundInfo.id}-group-${groupId}`)}
+                                  <Button size="sm" variant="outline" onClick={() => handleStartEditSynthesisGroup(result)} disabled={isCompletedView} className="gap-1">
+                                    <Edit3 className="h-4 w-4" />
+                                    编辑
+                                  </Button>
+                                </div>
+                              )}
                             </div>
-                            <div className="bg-muted/30 rounded-md p-3 text-sm whitespace-pre-wrap font-mono min-h-24">
-                              {content || "暂无提交结果"}
-                            </div>
+                            {result && isEditingGroupResult ? (
+                              <div className="space-y-2">
+                                <Textarea
+                                  value={synthesisGroupDrafts[result.id] ?? content}
+                                  onChange={(event) => setSynthesisGroupDrafts((prev) => ({ ...prev, [result.id]: event.target.value }))}
+                                  className={AI_RESULT_TEXTAREA_CLASS}
+                                  disabled={isSavingGroupResult}
+                                />
+                                <div className="flex gap-2">
+                                  <Button size="sm" onClick={() => handleSaveSynthesisGroupResult(result)} disabled={isSavingGroupResult} className="gap-1">
+                                    {isSavingGroupResult ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
+                                    {isSavingGroupResult ? "保存中..." : "保存"}
+                                  </Button>
+                                  <Button size="sm" variant="outline" onClick={handleCancelEditSynthesisGroup} disabled={isSavingGroupResult} className="gap-1">
+                                    <X className="h-4 w-4" />
+                                    取消
+                                  </Button>
+                                </div>
+                              </div>
+                            ) : (
+                              <MarkdownContent
+                                content={content}
+                                emptyText="暂无提交结果"
+                                className={cn(AI_RESULT_BOX_CLASS, "p-3")}
+                              />
+                            )}
                           </div>
                         );
                       })}
@@ -989,7 +1152,7 @@ export function HostDashboard() {
                               selectedSynthesisRoundInfo.synthesis.edited_content ?? selectedSynthesisRoundInfo.synthesis.original_content,
                               `synthesis-${selectedSynthesisRoundInfo.synthesis.id}`,
                             )}
-                            <Button size="sm" variant="outline" onClick={handleStartEditSynthesis} className="gap-1">
+                            <Button size="sm" variant="outline" onClick={handleStartEditSynthesis} disabled={isCompletedView} className="gap-1">
                               <Edit3 className="h-4 w-4" />
                               编辑
                             </Button>
@@ -1002,11 +1165,11 @@ export function HostDashboard() {
                             <Textarea
                               value={synthesisEditContent}
                               onChange={(event) => setSynthesisEditContent(event.target.value)}
-                              rows={12}
-                              className="font-mono text-sm"
+                              className={AI_RESULT_TEXTAREA_CLASS}
+                              disabled={isCompletedView}
                             />
                             <div className="flex gap-2">
-                              <Button size="sm" onClick={handleSaveEditSynthesis} className="gap-1">
+                              <Button size="sm" onClick={handleSaveEditSynthesis} disabled={isCompletedView} className="gap-1">
                                 <Save className="h-4 w-4" />
                                 保存
                               </Button>
@@ -1018,9 +1181,10 @@ export function HostDashboard() {
                           </div>
                         ) : (
                           <div className="space-y-3">
-                            <div className="bg-muted/30 rounded-md p-4 text-sm whitespace-pre-wrap font-mono">
-                              {(selectedSynthesisRoundInfo.synthesis.edited_content ?? selectedSynthesisRoundInfo.synthesis.original_content) || "(空)"}
-                            </div>
+                            <MarkdownContent
+                              content={selectedSynthesisRoundInfo.synthesis.edited_content ?? selectedSynthesisRoundInfo.synthesis.original_content}
+                              className={AI_RESULT_BOX_CLASS}
+                            />
                             {selectedSynthesisRoundInfo.synthesis.validation_error && (
                               <p className="text-sm text-destructive">
                                 失败原因: {selectedSynthesisRoundInfo.synthesis.validation_error}
@@ -1065,8 +1229,9 @@ export function HostDashboard() {
                         rows={10}
                         placeholder="请输入内容..."
                         className="font-mono text-sm"
+                        disabled={isCompletedView}
                       />
-                      <Button onClick={handleSaveHostInput} disabled={savingHostInput} className="gap-2">
+                      <Button onClick={handleSaveHostInput} disabled={isCompletedView || savingHostInput} className="gap-2">
                         {savingHostInput ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
                         保存
                       </Button>
@@ -1205,7 +1370,9 @@ export function HostDashboard() {
                         </Button>
                       </div>
                       <ScrollArea className="h-[50vh] rounded-md border">
-                        <pre className="p-4 text-sm whitespace-pre-wrap font-mono">{exportData.markdown}</pre>
+                        <div className="p-4">
+                          <MarkdownContent content={exportData.markdown} className="bg-transparent p-0" />
+                        </div>
                       </ScrollArea>
                     </div>
                   )}
@@ -1215,6 +1382,26 @@ export function HostDashboard() {
           </div>
         </div>
       </Tabs>
+      <Dialog open={Boolean(leaderTarget)} onOpenChange={(open) => !open && setLeaderTarget(null)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>设置组长</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              是否将 {leaderTarget?.name} 设置为第 {leaderTarget?.groupId} 组组长？
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setLeaderTarget(null)} disabled={settingLeader}>
+                取消
+              </Button>
+              <Button onClick={handleConfirmSetLeader} disabled={settingLeader || isCompletedView}>
+                {settingLeader ? <LoadingSpinner size="sm" /> : "确认设置"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

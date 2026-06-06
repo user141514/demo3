@@ -1,5 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
 import { workshopApi } from "@/services/api";
+import {
+  clearLastMemberWorkshop,
+  loadLastMemberWorkshop,
+  participantToSessionParticipant,
+  saveLastMemberWorkshop,
+} from "@/lib/memberSession";
 import type { WorkshopMemberView, ParticipantWithToken } from "@/types";
 
 export function useWorkshop(workshopId: number | null) {
@@ -24,15 +30,40 @@ export function useWorkshop(workshopId: number | null) {
           }
         } catch { /* ignore */ }
       }
+      if (!savedParticipant || savedParticipant.workshop_id !== workshopId) {
+        const lastMember = loadLastMemberWorkshop();
+        if (lastMember?.workshop_id === workshopId) {
+          savedParticipant = participantToSessionParticipant(lastMember);
+          setParticipant(savedParticipant);
+          sessionStorage.setItem("participant", JSON.stringify(savedParticipant));
+        }
+      }
       const data = await workshopApi.get(
         workshopId,
         savedParticipant?.workshop_id === workshopId ? savedParticipant.id : undefined,
         savedParticipant?.workshop_id === workshopId ? savedParticipant.session_token : undefined,
       );
       setWorkshop(data);
+      if (data.status === "completed") {
+        sessionStorage.removeItem("participant");
+        clearLastMemberWorkshop({ workshop_id: workshopId });
+        setParticipant(null);
+        return;
+      }
+      if (savedParticipant?.workshop_id === workshopId && !data.participant) {
+        sessionStorage.removeItem("participant");
+        clearLastMemberWorkshop({
+          workshop_id: workshopId,
+          participant_id: savedParticipant.id,
+          session_token: savedParticipant.session_token,
+        });
+        setParticipant(null);
+        return;
+      }
       if (data.participant) {
         setParticipant(data.participant);
         sessionStorage.setItem("participant", JSON.stringify(data.participant));
+        saveLastMemberWorkshop(data.invite_code, data.participant);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "获取工作坊失败");
@@ -49,6 +80,7 @@ export function useWorkshop(workshopId: number | null) {
       const p = await workshopApi.join(workshopId, name, inviteCode);
       setParticipant(p);
       sessionStorage.setItem("participant", JSON.stringify(p));
+      saveLastMemberWorkshop(inviteCode, p);
       return p;
     } catch (err) {
       setError(err instanceof Error ? err.message : "加入工作坊失败");

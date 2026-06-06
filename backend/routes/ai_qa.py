@@ -51,7 +51,7 @@ async def _build_member_ai_context(
     db: AsyncSession,
     workshop_id: int,
     group_id: int,
-    current_round: Round | None,
+    current_round: Optional[Round],
 ) -> tuple[str, int]:
     if not current_round:
         return "当前研讨会尚未进入有效轮次。", 0
@@ -260,7 +260,7 @@ async def get_ai_questions(
             AIQuestionLog.participant_id == participant_id,
             AIQuestionLog.round_id == (current_round.id if current_round else None),
         )
-        .order_by(AIQuestionLog.created_at.desc())
+        .order_by(AIQuestionLog.created_at.asc(), AIQuestionLog.id.asc())
     )
     logs = result.scalars().all()
     return [

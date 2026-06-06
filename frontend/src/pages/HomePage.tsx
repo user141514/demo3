@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowRight, Check, Copy, RefreshCw, Sparkles, UserCog, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,12 @@ import {
   saveLastHostWorkshop,
   type LastHostWorkshop,
 } from "@/lib/hostSession";
+import {
+  clearLastMemberWorkshop,
+  loadLastMemberWorkshop,
+  saveLastMemberWorkshop,
+  type LastMemberWorkshop,
+} from "@/lib/memberSession";
 import type { WorkshopCreateResponse } from "@/types";
 
 const DEFAULT_TITLE = "领导力共创研讨会";
@@ -21,6 +27,7 @@ const DEFAULT_TITLE = "领导力共创研讨会";
 export function HomePage() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
+  const loadingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(() => {
     const saved = sessionStorage.getItem("workshop_notice");
@@ -39,6 +46,7 @@ export function HomePage() {
 
   const [hostCodeInput, setHostCodeInput] = useState("");
   const [lastHost, setLastHost] = useState<LastHostWorkshop | null>(() => loadLastHostWorkshop());
+  const [lastMember, setLastMember] = useState<LastMemberWorkshop | null>(() => loadLastMemberWorkshop());
 
   useEffect(() => {
     if (!error) return;
@@ -52,6 +60,30 @@ export function HomePage() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    const record = loadLastMemberWorkshop();
+    if (!record) return;
+    let cancelled = false;
+    workshopApi.get(record.workshop_id, record.participant_id, record.session_token)
+      .then((data) => {
+        if (cancelled) return;
+        if (data.status === "completed" || !data.participant) {
+          clearLastMemberWorkshop(record);
+          sessionStorage.removeItem("participant");
+          setLastMember(null);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        clearLastMemberWorkshop(record);
+        sessionStorage.removeItem("participant");
+        setLastMember(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const persistHost = (w: WorkshopCreateResponse) => {
     saveLastHostWorkshop({
       workshop_id: w.id,
@@ -63,6 +95,8 @@ export function HomePage() {
 
   const handleCreate = async () => {
     if (!hostName.trim()) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -79,6 +113,8 @@ export function HomePage() {
 
   const handleJoin = async () => {
     if (!memberName.trim() || !inviteCode.trim()) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -89,10 +125,13 @@ export function HomePage() {
       }
       const p = await workshopApi.join(valid.workshop_id, memberName.trim(), inviteCode.trim());
       sessionStorage.setItem("participant", JSON.stringify(p));
+      saveLastMemberWorkshop(inviteCode.trim().toUpperCase(), p);
+      setLastMember(loadLastMemberWorkshop());
       navigate(`/workshop/${valid.workshop_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加入失败，请重试");
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   };
@@ -100,6 +139,8 @@ export function HomePage() {
   const handleHostRecover = async () => {
     const code = hostCodeInput.trim().toUpperCase();
     if (!code) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -117,6 +158,7 @@ export function HomePage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "校验主持人码失败，请重试");
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   };
@@ -130,6 +172,49 @@ export function HomePage() {
       return;
     }
     navigate(`/workshop/${record.workshop_id}/host?code=${encodeURIComponent(record.host_code)}`);
+  };
+
+  const handleContinueMember = async () => {
+    const record = loadLastMemberWorkshop();
+    if (!record) {
+      clearLastMemberWorkshop();
+      setLastMember(null);
+      setError("本机没有可继续的成员记录，请重新输入邀请码加入研讨会");
+      return;
+    }
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await workshopApi.get(record.workshop_id, record.participant_id, record.session_token);
+      if (data.status === "completed") {
+        clearLastMemberWorkshop(record);
+        sessionStorage.removeItem("participant");
+        setLastMember(null);
+        setError("该研讨会已结束，请创建或加入新的研讨会。");
+        return;
+      }
+      if (!data.participant) {
+        clearLastMemberWorkshop(record);
+        sessionStorage.removeItem("participant");
+        setLastMember(null);
+        setError("成员身份已失效，请重新输入邀请码加入研讨会");
+        return;
+      }
+      sessionStorage.setItem("participant", JSON.stringify(data.participant));
+      saveLastMemberWorkshop(record.invite_code, data.participant);
+      setLastMember(loadLastMemberWorkshop());
+      navigate(`/workshop/${record.workshop_id}`);
+    } catch (err) {
+      clearLastMemberWorkshop(record);
+      sessionStorage.removeItem("participant");
+      setLastMember(null);
+      setError(err instanceof Error ? err.message : "恢复成员身份失败，请重新加入研讨会");
+    } finally {
+      loadingRef.current = false;
+      setLoading(false);
+    }
   };
 
   const copyCode = (code: string, label: string) => {
@@ -290,6 +375,12 @@ export function HomePage() {
             <TabsContent value="member">
               <Card>
                 <CardContent className="p-6 space-y-4">
+                  {lastMember && (
+                    <Button variant="secondary" className="w-full gap-2" onClick={handleContinueMember} disabled={loading}>
+                      <RefreshCw className="h-4 w-4" />
+                      继续上次研讨：{lastMember.name}（第 {lastMember.group_id} 组）
+                    </Button>
+                  )}
                   <div className="space-y-2">
                     <Label htmlFor="memberName">您的姓名</Label>
                     <Input

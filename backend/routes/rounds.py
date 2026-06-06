@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import List, Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,6 +12,7 @@ from dependencies import get_ws_manager, get_ai_service
 from models import (
     Round, Question, Answer, Participant, GroupRoundResult,
     SynthesisResult, GroupResultStatus, Workshop, HostInput,
+    WorkshopStatus,
 )
 from schemas import (
     AnswerSubmit, AnswerOut, QuestionOut, GroupRoundResultOut,
@@ -23,6 +25,22 @@ from websocket_manager import WebSocketManager
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["rounds"])
+
+_group_ai_locks: dict[tuple[int, int, int], asyncio.Lock] = {}
+_synthesis_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_group_ai_lock(workshop_id: int, group_id: int, round_id: int) -> asyncio.Lock:
+    key = (workshop_id, group_id, round_id)
+    if key not in _group_ai_locks:
+        _group_ai_locks[key] = asyncio.Lock()
+    return _group_ai_locks[key]
+
+
+def _get_synthesis_lock(round_id: int) -> asyncio.Lock:
+    if round_id not in _synthesis_locks:
+        _synthesis_locks[round_id] = asyncio.Lock()
+    return _synthesis_locks[round_id]
 
 
 def _as_utc(value):
@@ -197,6 +215,7 @@ async def transfer_group_leader(
     ):
         raise HTTPException(status_code=400, detail="New leader must be in this group")
 
+    old_leader = participant
     result = await db.execute(
         select(Participant)
         .where(Participant.workshop_id == data.workshop_id, Participant.group_id == group_id)
@@ -218,6 +237,11 @@ async def transfer_group_leader(
         data.workshop_id,
         group_id,
         [member.model_dump() for member in out],
+        old_leader_participant_id=old_leader.id,
+        old_leader_name=old_leader.name,
+        new_leader_participant_id=new_leader.id,
+        new_leader_name=new_leader.name,
+        changed_by="member",
     )
     return out
 
@@ -258,6 +282,33 @@ async def trigger_group_ai(
     if not active_round:
         raise HTTPException(status_code=404, detail="No active round")
 
+    lock = _get_group_ai_lock(workshop_id, group_id, active_round.id)
+    if lock.locked():
+        raise HTTPException(status_code=400, detail="AI already generating")
+
+    async with lock:
+        return await _trigger_group_ai_locked(
+            group_id,
+            data,
+            workshop_id,
+            db,
+            ai_service,
+            ws_manager,
+            w,
+            active_round,
+        )
+
+
+async def _trigger_group_ai_locked(
+    group_id: int,
+    data: GroupAITrigger,
+    workshop_id: int,
+    db: AsyncSession,
+    ai_service: DeepSeekService,
+    ws_manager: WebSocketManager,
+    w: Workshop,
+    active_round: Round,
+) -> GroupRoundResultOut:
     # Check existing
     result = await db.execute(
         select(GroupRoundResult).where(
@@ -323,15 +374,16 @@ async def trigger_group_ai(
     try:
         round_num = active_round.round_number
         if round_num == 1:
-            content, version, err = await ai_service.generate_group_dimensions(answers_text)
+            content, version, err = await ai_service.generate_group_dimensions(answers_text, group_id)
         elif round_num == 2:
             framework = await _get_host_input(workshop_id, 1, db)
-            content, version, err = await ai_service.generate_group_layer_table(answers_text, framework)
+            content, version, err = await ai_service.generate_group_layer_table(answers_text, framework, group_id)
         elif round_num == 3:
             consensus = await _get_synthesis_or_host_input(workshop_id, 2, db)
-            content, version, err = await ai_service.generate_group_behaviors(answers_text, consensus)
+            content, version, err = await ai_service.generate_group_behaviors(answers_text, consensus, group_id)
         else:
-            content, version, err = f"# 讨论四：落地应用场景\n\n{answers_text}", 1, None
+            model_draft = await _get_synthesis_or_host_input(workshop_id, 3, db)
+            content, version, err = await ai_service.generate_group_applications(answers_text, model_draft, group_id)
 
         gr.original_content = content
         gr.version = version
@@ -408,6 +460,8 @@ async def edit_group_ai_result(
         raise HTTPException(status_code=404, detail="Workshop not found")
     if w.is_review_mode:
         raise HTTPException(status_code=403, detail="当前为历史轮次查看模式，不能编辑 AI 提炼结果")
+    if not data.edited_content.strip():
+        raise HTTPException(status_code=400, detail="编辑内容不能为空")
 
     result = await db.execute(
         select(Round).where(Round.workshop_id == workshop_id, Round.round_number == w.current_round)
@@ -426,12 +480,20 @@ async def edit_group_ai_result(
     if not gr:
         raise HTTPException(status_code=404, detail="No result yet")
 
-    gr.edited_content = data.edited_content
+    gr.edited_content = data.edited_content.strip()
     gr.status = GroupResultStatus.EDITED
     await db.commit()
     await db.refresh(gr)
 
     out = GroupRoundResultOut.model_validate(gr)
+    await ws_manager.broadcast_ai_result_status(
+        workshop_id,
+        group_id,
+        active_round.round_number,
+        gr.status.value,
+        gr.validation_error,
+        _result_updated_at(gr),
+    )
     await ws_manager.broadcast_result_ready(workshop_id, group_id, active_round.round_number, out.model_dump(mode="json"))
     return out
 
@@ -448,6 +510,24 @@ async def trigger_synthesis(
     rd = await db.get(Round, round_id)
     if not rd:
         raise HTTPException(status_code=404, detail="Round not found")
+    w = await db.get(Workshop, rd.workshop_id)
+    if w and w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
+
+    lock = _get_synthesis_lock(round_id)
+    if lock.locked():
+        raise HTTPException(status_code=400, detail="综合提炼正在生成中，请稍后再试")
+    async with lock:
+        return await _trigger_synthesis_locked(round_id, rd, db, ai_service, ws_manager)
+
+
+async def _trigger_synthesis_locked(
+    round_id: int,
+    rd: Round,
+    db: AsyncSession,
+    ai_service: DeepSeekService,
+    ws_manager: WebSocketManager,
+) -> SynthesisResultOut:
 
     result = await db.execute(
         select(GroupRoundResult).where(GroupRoundResult.round_id == round_id)
@@ -484,7 +564,7 @@ async def trigger_synthesis(
         elif rd.round_number == 3:
             content, version, err = await ai_service.synthesize_behaviors(groups_data)
         else:
-            content, version, err = "综合结果参见各组回答", 1, None
+            content, version, err = await ai_service.synthesize_applications(groups_data)
 
         sr.original_content = content
         sr.version = version

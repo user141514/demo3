@@ -111,6 +111,18 @@ export function useWorkshopHost(workshopId: number | null, hostCode: string | nu
     }
   }, [workshopId, hostCode]);
 
+  const setGroupLeader = useCallback(async (groupId: number, new_leader_participant_id: number) => {
+    if (!workshopId || !hostCode) return null;
+    try {
+      const data = await workshopApi.setGroupLeader(workshopId, groupId, hostCode, new_leader_participant_id);
+      setWorkshop(data);
+      return data;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "设置组长失败");
+      return null;
+    }
+  }, [workshopId, hostCode]);
+
   const triggerSynthesis = useCallback(async (roundId: number) => {
     try {
       const data = await groupApi.synthesize(roundId);
@@ -148,7 +160,7 @@ export function useWorkshopHost(workshopId: number | null, hostCode: string | nu
     workshop, loading, error,
     fetchHost, unlockRound, previousRound, updateRoundSettings,
     startTimer,
-    submitHostInput, editGroupResult, editSynthesis,
+    submitHostInput, editGroupResult, editSynthesis, setGroupLeader,
     triggerSynthesis, exportMarkdown,
   };
 }

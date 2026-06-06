@@ -90,8 +90,29 @@ class WebSocketManager:
         await self.broadcast_to_group(workshop_id, group_id, msg)
         await self.broadcast_to_host(workshop_id, msg)
 
-    async def broadcast_group_leader_changed(self, workshop_id: int, group_id: int, members: List[dict]):
-        msg = {"type": "group_leader_changed", "data": {"group_id": group_id, "members": members}}
+    async def broadcast_group_leader_changed(
+        self,
+        workshop_id: int,
+        group_id: int,
+        members: List[dict],
+        old_leader_participant_id: Optional[int] = None,
+        old_leader_name: Optional[str] = None,
+        new_leader_participant_id: Optional[int] = None,
+        new_leader_name: Optional[str] = None,
+        changed_by: str = "member",
+    ):
+        msg = {
+            "type": "group_leader_changed",
+            "data": {
+                "group_id": group_id,
+                "members": members,
+                "old_leader_participant_id": old_leader_participant_id,
+                "old_leader_name": old_leader_name,
+                "new_leader_participant_id": new_leader_participant_id,
+                "new_leader_name": new_leader_name,
+                "changed_by": changed_by,
+            },
+        }
         await self.broadcast_to_group(workshop_id, group_id, msg)
         await self.broadcast_to_host(workshop_id, msg)
 

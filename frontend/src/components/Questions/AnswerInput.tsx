@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Send } from "lucide-react";
@@ -30,6 +30,7 @@ export function AnswerInput({
   const [content, setContent] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     if (!draftKey) return;
@@ -40,6 +41,8 @@ export function AnswerInput({
   const handleSubmit = async () => {
     const trimmed = content.trim();
     if (!trimmed || disabled || submitDisabled) return;
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     setError(null);
     try {
@@ -49,6 +52,7 @@ export function AnswerInput({
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交失败，请重试");
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };

@@ -126,6 +126,12 @@ export const workshopApi = {
       body: JSON.stringify({ edited_content }),
     }),
 
+  setGroupLeader: (id: number, groupId: number, host_code: string, new_leader_participant_id: number) =>
+    request<WorkshopHostView>(`/workshops/${id}/groups/${groupId}/leader`, {
+      method: "PUT",
+      body: JSON.stringify({ host_code, new_leader_participant_id }),
+    }),
+
   export: (id: number, code: string) =>
     request<ExportResponse>(`/workshops/${id}/export?code=${encodeURIComponent(code)}`),
 };

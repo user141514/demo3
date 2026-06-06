@@ -4,11 +4,13 @@ import { useWorkshop } from "@/hooks/useWorkshop";
 import { useGroup } from "@/hooks/useGroup";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAIAssistant } from "@/hooks/useAIAssistant";
+import { clearLastMemberWorkshop } from "@/lib/memberSession";
 import { useCountdown } from "@/hooks/useCountdown";
 import { QuestionCard } from "@/components/Questions/QuestionCard";
 import { AnswerInput } from "@/components/Questions/AnswerInput";
 import { AnswerList } from "@/components/Questions/AnswerList";
 import { LoadingSpinner } from "@/components/Shared/LoadingSpinner";
+import { MarkdownContent } from "@/components/Shared/MarkdownContent";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -75,6 +77,8 @@ export function WorkshopPage() {
   const workshopId = id ? parseInt(id, 10) : null;
   const splitRef = useRef<HTMLDivElement | null>(null);
   const qaResizeRef = useRef<HTMLDivElement | null>(null);
+  const aiQaEndRef = useRef<HTMLDivElement | null>(null);
+  const actionLocksRef = useRef<Set<string>>(new Set());
 
   const { workshop, participant, loading, error, fetchWorkshop } = useWorkshop(workshopId);
   const groupId = participant?.group_id ?? null;
@@ -98,6 +102,7 @@ export function WorkshopPage() {
   const [savingAIResult, setSavingAIResult] = useState(false);
   const [leaderTransferTarget, setLeaderTransferTarget] = useState<Participant | null>(null);
   const [transferringLeader, setTransferringLeader] = useState(false);
+  const [memberNotice, setMemberNotice] = useState<string | null>(null);
   const [aiResultCollapsed, setAiResultCollapsed] = useState(() => {
     return sessionStorage.getItem(AI_RESULT_COLLAPSED_KEY) === "1";
   });
@@ -120,15 +125,30 @@ export function WorkshopPage() {
 
   const exitCompletedWorkshop = useCallback(() => {
     sessionStorage.removeItem("participant");
-    sessionStorage.setItem("workshop_notice", "研讨已结束，请重新进入或等待新的研讨会。");
+    if (participant) {
+      clearLastMemberWorkshop({
+        workshop_id: participant.workshop_id,
+        participant_id: participant.id,
+        session_token: participant.session_token,
+      });
+    } else if (workshopId) {
+      clearLastMemberWorkshop({ workshop_id: workshopId });
+    }
+    sessionStorage.setItem("workshop_notice", "该研讨会已结束，请创建或加入新的研讨会。");
     navigate("/");
-  }, [navigate]);
+  }, [navigate, participant, workshopId]);
 
   useEffect(() => {
     if (workshop?.status === "completed") {
       exitCompletedWorkshop();
     }
   }, [workshop?.status, exitCompletedWorkshop]);
+
+  useEffect(() => {
+    if (!memberNotice) return;
+    const timer = window.setTimeout(() => setMemberNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [memberNotice]);
 
   useEffect(() => {
     sessionStorage.setItem(PANEL_RATIO_KEY, String(panelRatio));
@@ -146,6 +166,10 @@ export function WorkshopPage() {
     clearHistory();
     if (participant && currentRound) fetchHistory();
   }, [participant?.id, currentRound?.id, fetchHistory, clearHistory]);
+
+  useEffect(() => {
+    aiQaEndRef.current?.scrollIntoView({ block: "end" });
+  }, [history.length, currentRound?.id]);
 
   useEffect(() => {
     setExpired(false);
@@ -201,6 +225,9 @@ export function WorkshopPage() {
       case "result_ready":
         fetchAIResult();
         break;
+      case "ai_result_status":
+        fetchAIResult();
+        break;
       case "round_changed":
         clearRoundState();
         clearHistory();
@@ -219,13 +246,27 @@ export function WorkshopPage() {
         break;
       }
       case "group_leader_changed":
+        if (participant && Number(msg.data.group_id) === participant.group_id) {
+          const newLeaderName = typeof msg.data.new_leader_name === "string" ? msg.data.new_leader_name : "";
+          const newLeaderId = Number(msg.data.new_leader_participant_id);
+          const changedBy = String(msg.data.changed_by ?? "");
+          if (changedBy === "host") {
+            if (newLeaderId === participant.id) {
+              setMemberNotice(`你已被主持人设置为第 ${participant.group_id} 组组长。`);
+            } else if (participant.is_group_leader) {
+              setMemberNotice(`主持人已将第 ${participant.group_id} 组组长切换为 ${newLeaderName}。`);
+            } else {
+              setMemberNotice(`第 ${participant.group_id} 组组长已切换为 ${newLeaderName}。`);
+            }
+          }
+        }
         fetchWorkshop({ silent: true });
         break;
       case "workshop_completed":
         exitCompletedWorkshop();
         break;
     }
-  }, [addAnswer, clearHistory, clearRoundState, exitCompletedWorkshop, fetchAIResult, fetchWorkshop, reset, start]);
+  }, [addAnswer, clearHistory, clearRoundState, exitCompletedWorkshop, fetchAIResult, fetchWorkshop, participant, reset, start]);
 
   useWebSocket({
     workshopId,
@@ -236,7 +277,13 @@ export function WorkshopPage() {
   const handleTriggerAI = useCallback(async () => {
     if (workshop?.is_review_mode) return;
     if (!participant?.is_group_leader) return;
-    await triggerAI(participant.id, participant.session_token);
+    if (actionLocksRef.current.has("trigger-ai")) return;
+    actionLocksRef.current.add("trigger-ai");
+    try {
+      await triggerAI(participant.id, participant.session_token);
+    } finally {
+      actionLocksRef.current.delete("trigger-ai");
+    }
   }, [participant, triggerAI, workshop?.is_review_mode]);
 
   const handleSubmitAnswer = useCallback(
@@ -244,7 +291,14 @@ export function WorkshopPage() {
       if (!participant) throw new Error("请先加入研讨会");
       if (workshop?.is_review_mode) throw new Error("当前为历史轮次查看模式，不能提交回答");
       if (expired) throw new Error("时间已到，无法继续提交");
-      return submitAnswer(participant.id, participant.session_token, questionId, content);
+      const key = `answer:${questionId}`;
+      if (actionLocksRef.current.has(key)) return null;
+      actionLocksRef.current.add(key);
+      try {
+        return await submitAnswer(participant.id, participant.session_token, questionId, content);
+      } finally {
+        actionLocksRef.current.delete(key);
+      }
     },
     [expired, participant, submitAnswer, workshop?.is_review_mode],
   );
@@ -257,26 +311,38 @@ export function WorkshopPage() {
 
   const handleConfirmLeaderTransfer = async () => {
     if (!participant || !leaderTransferTarget) return;
+    if (actionLocksRef.current.has("transfer-leader")) return;
+    actionLocksRef.current.add("transfer-leader");
     setTransferringLeader(true);
-    const updated = await transferLeader(
-      participant.id,
-      participant.session_token,
-      leaderTransferTarget.id,
-    );
-    if (updated) {
-      setLeaderTransferTarget(null);
-      await fetchWorkshop({ silent: true });
+    try {
+      const updated = await transferLeader(
+        participant.id,
+        participant.session_token,
+        leaderTransferTarget.id,
+      );
+      if (updated) {
+        setLeaderTransferTarget(null);
+        await fetchWorkshop({ silent: true });
+      }
+    } finally {
+      setTransferringLeader(false);
+      actionLocksRef.current.delete("transfer-leader");
     }
-    setTransferringLeader(false);
   };
 
   const handleAsk = useCallback(async () => {
     const q = aiQuestion.trim();
     if (!q || asking) return;
-    const result = await ask(q);
-    if (result) {
-      setAiQuestion("");
-      fetchHistory();
+    if (actionLocksRef.current.has("ai-ask")) return;
+    actionLocksRef.current.add("ai-ask");
+    try {
+      const result = await ask(q);
+      if (result) {
+        setAiQuestion("");
+        fetchHistory();
+      }
+    } finally {
+      actionLocksRef.current.delete("ai-ask");
     }
   }, [aiQuestion, asking, ask, fetchHistory]);
 
@@ -294,13 +360,19 @@ export function WorkshopPage() {
     if (!participant) return;
     const content = aiResultDraft.trim();
     if (!content) return;
+    if (actionLocksRef.current.has("save-ai-result")) return;
+    actionLocksRef.current.add("save-ai-result");
     setSavingAIResult(true);
-    const result = await editAIResult(participant.id, participant.session_token, content);
-    if (result) {
-      setEditingAIResult(false);
-      setAIResultDraft("");
+    try {
+      const result = await editAIResult(participant.id, participant.session_token, content);
+      if (result) {
+        setEditingAIResult(false);
+        setAIResultDraft("");
+      }
+    } finally {
+      setSavingAIResult(false);
+      actionLocksRef.current.delete("save-ai-result");
     }
-    setSavingAIResult(false);
   };
 
   if (loading) {
@@ -358,6 +430,11 @@ export function WorkshopPage() {
 
   return (
     <div className="h-[calc(100vh-3.5rem)] flex flex-col bg-background">
+      {memberNotice && (
+        <div className="bg-primary/10 px-6 py-2 text-sm text-primary">
+          <div className="mx-auto max-w-7xl">{memberNotice}</div>
+        </div>
+      )}
       <header className="border-b bg-card px-6 py-4 shrink-0">
         <div className="max-w-6xl mx-auto space-y-4">
           <div className="text-center space-y-2">
@@ -486,9 +563,9 @@ export function WorkshopPage() {
               </div>
             ) : (
               <div className="space-y-8">
-                {questions.map((question) => (
+                {questions.map((question, index) => (
                   <div key={question.id} className="space-y-4">
-                    <QuestionCard question={question} />
+                    <QuestionCard question={question} questionNumber={index + 1} />
                     <div className="pl-4 border-l-2 border-muted space-y-4">
                       <AnswerList answers={answers} questionId={question.id} />
                       {participant ? (
@@ -623,9 +700,11 @@ export function WorkshopPage() {
                         </div>
                       ) : (
                         <div className="space-y-3">
-                          <div className="rounded-md bg-muted/30 p-3 text-sm leading-relaxed whitespace-pre-wrap break-words">
-                            {aiResult.edited_content ?? aiResult.original_content ?? "暂无内容"}
-                          </div>
+                          <MarkdownContent
+                            content={aiResult.edited_content ?? aiResult.original_content}
+                            emptyText="暂无内容"
+                            className="p-3"
+                          />
                           {canEditAIResult && (
                             <Button size="sm" variant="outline" onClick={handleStartEditAIResult} className="gap-1">
                               <Edit3 className="h-4 w-4" />
@@ -703,6 +782,7 @@ export function WorkshopPage() {
                           </div>
                         </div>
                       ))}
+                      <div ref={aiQaEndRef} />
                     </div>
                   </ScrollArea>
                 </div>

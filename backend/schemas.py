@@ -133,7 +133,7 @@ class GroupRoundResultOut(APIModel):
 
 
 class GroupResultEdit(APIModel):
-    edited_content: str
+    edited_content: str = Field(..., min_length=1)
 
 
 class GroupResultMemberEdit(APIModel):
@@ -154,6 +154,11 @@ class GroupLeaderTransfer(APIModel):
     new_leader_participant_id: int
 
 
+class HostGroupLeaderSet(APIModel):
+    host_code: str
+    new_leader_participant_id: int
+
+
 # ---------- Synthesis Result ----------
 class SynthesisResultOut(APIModel):
     id: int
@@ -171,7 +176,7 @@ class SynthesisResultOut(APIModel):
 
 
 class SynthesisResultEdit(APIModel):
-    edited_content: str
+    edited_content: str = Field(..., min_length=1)
 
 
 # ---------- Host Input ----------

@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -20,6 +21,7 @@ from schemas import (
     HostInputCreate, RoundSettingsUpdate, GroupResultEdit, SynthesisResultEdit,
     KnowledgeDocumentOut, ExportResponse,
     ValidateHostRequest, ValidateInviteRequest, ValidateResponse,
+    HostGroupLeaderSet,
 )
 from services.ai_service import DeepSeekService
 from services.export_service import ExportService
@@ -31,6 +33,15 @@ import secrets
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/workshops", tags=["workshops"])
+
+_workshop_action_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _get_workshop_action_lock(workshop_id: int, action: str) -> asyncio.Lock:
+    key = (workshop_id, action)
+    if key not in _workshop_action_locks:
+        _workshop_action_locks[key] = asyncio.Lock()
+    return _workshop_action_locks[key]
 
 
 def _as_utc(value):
@@ -183,6 +194,16 @@ def _round_to_dict(r: Round) -> dict:
     }
 
 
+def _participant_out(p: Participant) -> ParticipantOut:
+    return ParticipantOut(
+        id=p.id,
+        workshop_id=p.workshop_id,
+        name=p.name,
+        group_id=p.group_id,
+        is_group_leader=p.is_group_leader,
+    )
+
+
 # ── endpoints ────────────────────────────────────────────────────────────
 
 @router.post("", response_model=WorkshopCreateResponse, status_code=201)
@@ -308,6 +329,8 @@ async def unlock_round(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
 
     flow_round = w.flow_round_number or w.current_round
     current = next((r for r in w.rounds if r.round_number == flow_round), None)
@@ -383,6 +406,8 @@ async def start_round_timer(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
     if w.is_review_mode:
         raise HTTPException(status_code=400, detail="当前为历史轮次查看模式，不能开始计时")
 
@@ -416,6 +441,8 @@ async def update_round_settings(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
     if w.is_review_mode:
         raise HTTPException(status_code=400, detail="当前为历史轮次查看模式，不能修改本轮时长")
 
@@ -438,6 +465,8 @@ async def submit_host_input(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
 
     _ = round  # avoid shadow
     rd = await db.get(Round, data.round_id)
@@ -463,18 +492,41 @@ async def submit_host_input(
 async def edit_group_result(
     workshop_id: int, result_id: int, data: GroupResultEdit, code: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
 ):
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
+    if not data.edited_content.strip():
+        raise HTTPException(status_code=400, detail="编辑内容不能为空")
     gr = await db.get(GroupRoundResult, result_id)
     if not gr:
         raise HTTPException(status_code=404, detail="Result not found")
-    gr.edited_content = data.edited_content
+    rd = next((round_item for round_item in w.rounds if round_item.id == gr.round_id), None)
+    if not rd:
+        raise HTTPException(status_code=404, detail="Round not found")
+    if gr.group_id < 1 or gr.group_id > (w.group_count or 4):
+        raise HTTPException(status_code=400, detail="小组编号无效")
+    if not gr.original_content:
+        raise HTTPException(status_code=400, detail="该小组该轮次尚无 AI 提炼结果")
+    gr.edited_content = data.edited_content.strip()
     gr.status = GroupResultStatus.EDITED
     await db.commit()
     await db.refresh(gr)
-    return GroupRoundResultOut.model_validate(gr)
+    out = GroupRoundResultOut.model_validate(gr)
+    updated_at = _as_utc(gr.updated_at).isoformat().replace("+00:00", "Z") if gr.updated_at else None
+    await ws_manager.broadcast_ai_result_status(
+        workshop_id,
+        gr.group_id,
+        rd.round_number,
+        gr.status.value,
+        gr.validation_error,
+        updated_at,
+    )
+    await ws_manager.broadcast_result_ready(workshop_id, gr.group_id, rd.round_number, out.model_dump(mode="json"))
+    return out
 
 
 @router.put("/{workshop_id}/synthesis/{round_id}", response_model=SynthesisResultOut)
@@ -485,17 +537,62 @@ async def edit_synthesis_result(
     w = await _load_workshop(workshop_id, db)
     if w.host_code != code:
         raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
+    if not data.edited_content.strip():
+        raise HTTPException(status_code=400, detail="编辑内容不能为空")
     result = await db.execute(
         select(SynthesisResult).where(SynthesisResult.round_id == round_id, SynthesisResult.workshop_id == workshop_id)
     )
     sr = result.scalar_one_or_none()
     if not sr:
         raise HTTPException(status_code=404, detail="Synthesis result not found")
-    sr.edited_content = data.edited_content
+    sr.edited_content = data.edited_content.strip()
     sr.status = GroupResultStatus.EDITED
     await db.commit()
     await db.refresh(sr)
     return SynthesisResultOut.model_validate(sr)
+
+
+@router.put("/{workshop_id}/groups/{group_id}/leader", response_model=WorkshopHostView)
+async def set_group_leader_by_host(
+    workshop_id: int,
+    group_id: int,
+    data: HostGroupLeaderSet,
+    db: AsyncSession = Depends(get_db),
+    ws_manager: WebSocketManager = Depends(get_ws_manager),
+):
+    w = await _load_workshop(workshop_id, db)
+    if w.host_code != data.host_code:
+        raise HTTPException(status_code=403, detail="Invalid host code")
+    if w.status == WorkshopStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="本次研讨已结束，当前仅支持查看会议资料。")
+
+    new_leader = next((p for p in w.participants if p.id == data.new_leader_participant_id), None)
+    if not new_leader:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    if new_leader.workshop_id != workshop_id or new_leader.group_id != group_id:
+        raise HTTPException(status_code=400, detail="新组长必须属于当前研讨会和对应小组")
+
+    group_members = [p for p in w.participants if p.group_id == group_id]
+    old_leader = next((p for p in group_members if p.is_group_leader), None)
+    for member in group_members:
+        member.is_group_leader = member.id == new_leader.id
+
+    await db.commit()
+    w = await _load_workshop(workshop_id, db)
+    updated_members = [p for p in w.participants if p.group_id == group_id]
+    await ws_manager.broadcast_group_leader_changed(
+        workshop_id,
+        group_id,
+        [_participant_out(member).model_dump() for member in sorted(updated_members, key=lambda item: item.id)],
+        old_leader_participant_id=old_leader.id if old_leader else None,
+        old_leader_name=old_leader.name if old_leader else None,
+        new_leader_participant_id=new_leader.id,
+        new_leader_name=new_leader.name,
+        changed_by="host",
+    )
+    return _build_host_view(w)
 
 
 @router.get("/{workshop_id}/export", response_model=ExportResponse)
